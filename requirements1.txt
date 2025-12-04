@@ -1,0 +1,9 @@
+python-dotenv
+requests
+schedule
+qdrant-client[grpc]>=1.0.0
+fastapi
+uvicorn[standard]
+apscheduler
+pika
+guardrails-ai
