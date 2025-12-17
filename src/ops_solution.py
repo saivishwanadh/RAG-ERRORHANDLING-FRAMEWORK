@@ -1,0 +1,244 @@
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+import json
+from typing import Dict, Any, Optional
+import os
+import re as r
+import logging
+from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
+
+from src.config import Config
+from src.embeddingmodel import EmbeddingGenerator
+from src.vectordb import QdrantStore
+from src.structuraldb import DB
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Dependencies
+def get_db():
+    db = DB()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_embedding_generator():
+    return EmbeddingGenerator(api_key=Config.HUGGINGFACE_APIKEY)
+
+def get_vector_store():
+    return QdrantStore()
+
+# Helper functions
+def extract_solution(llm_solution_string: str, solution_id: str) -> str:
+    try:
+        if not llm_solution_string:
+            return ""
+        # Convert JSON string to dict
+        data = json.loads(llm_solution_string)
+        # Build key dynamically → solution1 / solution2 / solution3
+        key = f"solution{solution_id}"
+        # Return only instructions text
+        return data.get(key, {}).get("instructions", "")
+    except Exception as e:
+        logger.warning(f"Failed to extract solution: {e}")
+        return ""
+
+def clean_error_description(text: str) -> dict:
+    """Normalize/clean incoming description """
+    if not text:
+        return {"cleanText": ""}
+
+    s = text
+    s = s.replace("\\n", " ").replace("\n", " ")
+    s = s.replace('\\"', "").replace("&quot;", "")
+    s = r.sub(r"\s+", " ", s)
+    s = r.sub(r"[\(\)\[\]\{\}]", "", s)
+    s = r.sub(r"[\'\":;^|\-,]", "", s)
+    s = s.strip().strip('"').strip("'")
+    return {"cleanText": s}
+
+def get_ui_template(template_name: str) -> str:
+    """Load HTML template from UI directory"""
+    base_dir = Path(__file__).resolve().parents[1]
+    template_path = base_dir / "UI" / template_name
+    
+    if not template_path.exists():
+        logger.error(f"Template not found: {template_path}")
+        raise HTTPException(status_code=500, detail="UI Template not found")
+        
+    return template_path.read_text(encoding="utf-8")
+
+# Routes
+@app.get("/health")
+async def health_check():
+    from time import time
+    return {"status": "healthy", "timestamp": time()}
+
+@app.get("/exposeFeedBackUI-for-solutionSelection", response_class=HTMLResponse)
+async def load_solution(request: Request, db: DB = Depends(get_db)):
+    token = request.query_params.get("token")
+    solution_id = request.query_params.get("SOLUTION_ID")
+    
+    if not token or not solution_id:
+        return HTMLResponse("Missing token or SOLUTION_ID", status_code=400)
+    
+    rows = db.execute(
+        "SELECT * FROM errorsolutiontable WHERE sessionid=%s",
+        (token,), 
+        fetch=True
+    )
+    
+    if not rows:
+        return HTMLResponse("Session not found", status_code=404)
+        
+    record = rows[0]
+    
+    payload = {
+        "serviceName": record.get("application_name"),
+        "environment": "Non Prod", # TODO: Make dynamic
+        "timestamp": record.get("error_timestamp"),
+        "errorType": record.get("error_code"),
+        "errorMessage": record.get("error_description"),
+        "errorId": record.get("id"),
+        "sessionId": record.get("sessionid"),
+        "solution": record.get("llm_solution"),
+    }
+    
+    selected_solution = extract_solution(payload.get("solution"), solution_id)
+    
+    html_template = get_ui_template("llm-suggested-submit-ui.html")
+    
+    html = (
+        html_template
+        .replace("{{ERROR_ID}}", str(payload.get("errorId")))
+        .replace("{{ERROR_TYPE}}", str(payload.get("errorType")))
+        .replace("{{SOLUTION_TEXT}}", selected_solution)
+        .replace("{{SOLUTION_ID}}", str(solution_id))
+    )
+    return HTMLResponse(html, media_type="text/html")
+
+@app.get("/exposeFeedBackUI-for-CustomSolution", response_class=HTMLResponse)
+async def custom_solution(request: Request, db: DB = Depends(get_db)):
+    token = request.query_params.get("token")
+    
+    if not token:
+        return HTMLResponse("Missing token", status_code=400)
+
+    rows = db.execute(
+        "SELECT * FROM errorsolutiontable WHERE sessionid=%s",
+        (token,), 
+        fetch=True
+    )
+    
+    if not rows:
+        return HTMLResponse("Session not found", status_code=404)
+
+    record = rows[0]
+    payload = {
+        "serviceName": record.get("application_name"),
+        "environment": "Non Prod",
+        "timestamp": record.get("error_timestamp"),
+        "errorType": record.get("error_code"),
+        "errorMessage": record.get("error_description"),
+        "errorId": record.get("id"),
+        "sessionId": record.get("sessionid"),
+        "solution": record.get("llm_solution"),
+    }
+    
+    html_template = get_ui_template("custom-solution-submit-ui.html")
+    
+    html = (
+        html_template
+        .replace("{{ERROR_ID}}", str(payload.get("errorId")))
+        .replace("{{ERROR_TYPE}}", str(payload.get("errorType")))
+    )
+    return HTMLResponse(html, media_type="text/html")
+
+@app.post("/submitopssolution")
+async def update_vector(
+    request: Request, 
+    db: DB = Depends(get_db),
+    # Injected dependencies for better testing/performance
+    embed_gen: EmbeddingGenerator = Depends(get_embedding_generator),
+    store: QdrantStore = Depends(get_vector_store)
+):
+    payload = await request.json()
+    record_id = payload.get("errorId")
+    custom_solution = payload.get("customSolution")
+    selected_solution_id = payload.get("solutionId")
+    solution_timestamp = payload.get("solutionTimestamp")
+    
+    # Check if session is active
+    rows = db.execute(
+        "SELECT sessionid_status FROM errorsolutiontable WHERE id=%s",
+        (record_id,), fetch=True
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Record not found")
+    
+    if rows[0]["sessionid_status"] != "active":
+        return JSONResponse(
+            content={"error": "Session Expired", "status": "inactive", "message": "Your session has expired"},
+            status_code=404
+        )
+        
+    # If custom solution is not provided, fetch from LLM solution
+    if custom_solution is None:
+        row = db.execute(
+            "SELECT error_code,error_description,llm_solution FROM errorsolutiontable WHERE id=%s",
+            (record_id,), fetch=True
+        )[0]
+
+        llm_solution_dict = json.loads(row["llm_solution"])
+        solution_key = f"solution{selected_solution_id}"
+        custom_solution = llm_solution_dict.get(solution_key, {}).get("instructions")
+        
+    # Update DB
+    db.execute(
+        """UPDATE errorsolutiontable
+           SET ops_solution=%s, ops_solution_timestamp=%s, sessionid_status=%s
+           WHERE id=%s""",
+        (custom_solution, solution_timestamp, "inactive", record_id,)
+    )
+    
+    # Fetch record again for embedding creation
+    # Optimization: We might already have this info if we fetched it above, 
+    # but strictly speaking we only fetched it if custom_solution was None.
+    # Safe to fetch again to be sure we have latest state.
+    record = db.execute(
+        "SELECT application_name,error_code,error_description,ops_solution FROM errorsolutiontable WHERE id=%s",
+        (record_id,), fetch=True
+    )[0]
+    
+    clean_desc = clean_error_description(record["error_description"])
+    embed_input = f"Error:{record['error_code']} Description:{clean_desc.get('cleanText', '')}"
+    
+    # Generate Embedding
+    raw_embedding_input = embed_gen.get_embedding(embed_input)
+    
+    # Upsert to Vector DB
+    store.upsert_vector(
+        collection="error_solutions",
+        vector_id=int(record_id),
+        vector=raw_embedding_input,
+        payload={
+            "error_code": record.get("error_code", ""),
+            "error_description": record.get("error_description", ""),
+            "solution": custom_solution
+        }
+    )
+    
+    return {"message": "Vector DB updated successfully", "status": "SUCCESS"}
