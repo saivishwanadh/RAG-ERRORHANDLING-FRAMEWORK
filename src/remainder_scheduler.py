@@ -136,7 +136,7 @@ def send_reminder(record: dict) -> bool:
         # Create subject with reminder count
         retry_number = record["retry_count"] + 1
         subject = (
-            f"Error Notification (Reminder {retry_number}/{Config.MAX_RETRY_COUNT}): "
+            f"Error Notification (Remainder {retry_number}/{Config.MAX_RETRY_COUNT}): "
             f"{email_payload['errorType']} in {email_payload['serviceName']}"
         )
         
