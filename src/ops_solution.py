@@ -36,10 +36,10 @@ def get_db():
         db.close()
 
 def get_embedding_generator():
-    return EmbeddingGenerator(api_key=Config.HUGGINGFACE_APIKEY)
+    return EmbeddingGenerator(api_key=Config.GEMINI_APIKEY)
 
-def get_vector_store():
-    return QdrantStore()
+def get_vector_store(embed_gen: EmbeddingGenerator = Depends(get_embedding_generator)):
+    return QdrantStore(embedding_model=embed_gen.embeddings)
 
 # Helper functions
 def extract_solution(llm_solution_string: str, solution_id: str) -> str:

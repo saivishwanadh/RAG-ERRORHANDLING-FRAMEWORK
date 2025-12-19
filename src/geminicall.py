@@ -1,82 +1,78 @@
 import json
-import re
-import requests
 import logging
+import re
 from typing import Dict, Any, Optional
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import SystemMessagePromptTemplate, HumanMessagePromptTemplate, ChatPromptTemplate
 from src.prompt import PromptBuilder
 from src.config import Config
 
 logger = logging.getLogger(__name__)
 
 class GeminiClient:
-    """Minimal Gemini client for MuleSoft error analysis - JSON output only"""
+    """Gemini client using LangChain"""
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or Config.GEMINI_APIKEY
         self.model = model or Config.GEMINI_MODEL
-        self.base_url = Config.GEMINI_URL
         
-        if not self.api_key or not self.model or not self.base_url:
-            logger.warning("Gemini configuration missing (API Key, Model, or URL)")
+        if not self.api_key:
+            logger.warning("Gemini API Key missing")
         
-        self.url = f"{self.base_url}/{self.model}:generateContent?key={self.api_key}"
+        self.llm = ChatGoogleGenerativeAI(
+            model=self.model,
+            google_api_key=self.api_key,
+            temperature=0.0,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=8192,
+            convert_system_message_to_human=True, # Sometimes needed for certain Gemini versions/LangChain adaptors
+            model_kwargs={"response_mime_type": "application/json"}
+        )
         self.prompt_builder = PromptBuilder()
-        logger.info(f"Initialized GeminiClient with model: {self.model}")
+        logger.info(f"Initialized GeminiClient (LangChain) with model: {self.model}")
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         """Extract JSON from response"""
-
-        # JSON inside {}
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
+            candidate = match.group(0).strip()
             try:
-                return json.loads(match.group(0).strip())
-            except json.JSONDecodeError:
-                pass
-
+                return json.loads(candidate)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+        
+        # If we reach here, extraction failed
+        logger.error(f"Failed to extract JSON from response. Raw content:\n{text}")
         raise ValueError("Could not extract JSON from response")
 
-    def analyze_error(self, error_code: str, error_description: str) -> Dict[str, Any]:
+    def analyze_error(self, error_code: str, error_description: str, context: str = "") -> Dict[str, Any]:
         """
-        Build system prompt dynamically and analyze error
+        Analyze error using LangChain invocation
         """
-        if not self.api_key:
-             raise ValueError("Gemini API Key is not configured")
+        # Get ChatPromptTemplate from builder (pre-filled with platform context)
+        prompt_template = self.prompt_builder.get_prompt_template(platform="mulesoft")
 
-        # Dynamically build the full SYSTEM PROMPT
-        dynamic_system_prompt = self.prompt_builder.get_prompt(
-            platform="mulesoft",
-            error_code=error_code,
-            error_description=error_description
-        )
-
-        payload = {
-            "systemInstruction": {"parts": [{"text": dynamic_system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": error_description}]}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "topP": 0.95,
-                "topK": 40,
-                "maxOutputTokens": 8192
-            }
-        }
-
+        # Create chain using LCEL (LangChain Expression Language) style or simple piping
+        # chain = prompt | llm
+        chain = prompt_template | self.llm
+        
         try:
-            response = requests.post(self.url, json=payload, timeout=60)
-            response.raise_for_status()
-
-            data = response.json()
-            # Safety check for response structure
-            try:
-                text = data['candidates'][0]['content']['parts'][0]['text']
-            except (KeyError, IndexError) as e:
-                logger.error(f"Unexpected response structure from Gemini: {data}")
-                raise ValueError("Unexpected response structure from Gemini") from e
-                
-            logger.info(f"Received response text from Gemini")
-
-            return self._extract_json(text)
+            logger.info("Invoking Gemini via LangChain chain...")
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Gemini API request failed: {e}")
+            # Context handling: If None or empty, provide a fallback "None" string so template parses
+            context_val = context if context else "None"
+            
+            response_msg = chain.invoke({
+                "ERROR_CODE": error_code, 
+                "ERROR_DESCRIPTION": error_description,
+                "CONTEXT": context_val
+            })
+            
+            content = response_msg.content
+            logger.info("Received response from Gemini (LangChain)")
+            return self._extract_json(content)
+            
+        except Exception as e:
+            logger.error(f"Gemini/LangChain request failed: {e}")
             raise

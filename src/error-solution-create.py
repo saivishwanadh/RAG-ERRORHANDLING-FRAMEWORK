@@ -135,9 +135,18 @@ class ServiceContainer:
         logger.info("Initializing services...")
         Config.validate()
 
+        # Embedding - Init first as it's needed for Qdrant
+        try:
+            self.embed_gen = EmbeddingGenerator(api_key=Config.GEMINI_APIKEY)
+            logger.info("Embedding generator initialized")
+        except Exception as e:
+            logger.exception("Failed to init Embedding generator")
+            raise
+
         # Qdrant
         try:
-            self.store = QdrantStore()
+            # Pass embedding model to QdrantStore
+            self.store = QdrantStore(embedding_model=self.embed_gen.embeddings)
             logger.info("Qdrant initialized")
         except Exception as e:
             logger.exception("Failed to init Qdrant")
@@ -149,14 +158,6 @@ class ServiceContainer:
             logger.info("Gemini initialized")
         except Exception as e:
             logger.exception("Failed to init Gemini")
-            raise
-
-        # Embedding
-        try:
-            self.embed_gen = EmbeddingGenerator(api_key=Config.HUGGINGFACE_APIKEY)
-            logger.info("Embedding generator initialized")
-        except Exception as e:
-            logger.exception("Failed to init Embedding generator")
             raise
 
         # Sanitizer
@@ -208,11 +209,17 @@ class ServiceContainer:
 
     # qdrant search wrapper
     @retry(exceptions=(Exception,), max_attempts=3)
-    def qdrant_search(self, collection: str, vector, limit: int = 3, query_filter=None):
+    def qdrant_search(self, collection: str, vector, limit: int = 3, query_filter=None, text_query: Optional[str] = None):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
         try:
-            res = self.store.search(collection=collection, vector=vector, limit=limit, query_filter=query_filter)
+            res = self.store.search(
+                collection=collection, 
+                vector=vector, 
+                limit=limit, 
+                query_filter=query_filter,
+                text_query=text_query
+            )
             self.cb_qdrant.record_success()
             return res
         except Exception as e:
@@ -221,11 +228,12 @@ class ServiceContainer:
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3, allowed_status_for_retry=(429,))
-    def call_llm(self, error_code: str, description: str):
+    def call_llm(self, error_code: str, description: str, context: str = ""):
         if self.cb_llm.is_open():
             raise Exception("LLM circuit open")
         try:
-            res = self.client.analyze_error(error_code, description)
+            # Pass context to GeminiClient
+            res = self.client.analyze_error(error_code, description, context=context)
             self.cb_llm.record_success()
             return res
         except requests.exceptions.HTTPError:
@@ -257,7 +265,7 @@ class ServiceContainer:
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3)
-    def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict):
+    def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict, text_content: Optional[str] = None):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
 
@@ -266,7 +274,8 @@ class ServiceContainer:
                 collection=collection,
                 vector_id=vector_id,
                 vector=vector,
-                payload=payload
+                payload=payload,
+                text_content=text_content
             )
             self.cb_qdrant.record_success()
             return True
@@ -370,19 +379,22 @@ def db_insert(llmresponse: dict):
 
     # embedding -> qdrant (best-effort)
     try:
+        # LangChain handles embedding automatically if we pass text
         embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
-        raw_embedding = services.embed_gen.get_embedding(embed_input)
+        
+        # We pass text_content for automatic embedding generation by LangChain-Qdrant
         services.qdrant_upsert(
             collection='error_solutions',
             vector_id=new_id,
-            vector=raw_embedding,
+            vector=None, # Not needed for LangChain path
             payload={
                 'error_code': services.incoming_payload.get('code',''),
                 'error_description': cleanErr.get('cleanText',''),
                 'solution': llmresponse
-        }
-)
-        logger.info("Stored vector embedding")
+            },
+            text_content=embed_input
+        )
+        logger.info("Stored vector embedding (managed by LangChain)")
     except Exception:
         logger.exception("Failed to store vector embedding (non-fatal)")
 
@@ -455,15 +467,33 @@ def main():
     try:
         cleanErr = clean_error_description(services.masked_errordescription)
         embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
-        raw_embedding = services.embed_gen.get_embedding(embed_input)
-
+        
+        # Use text query - LangChain handles embedding
         qfilter = models.Filter(must=[models.FieldCondition(key='error_code', match=models.MatchValue(value=services.incoming_payload.get('code')))])
-        result = services.qdrant_search(collection='error_solutions', vector=raw_embedding, limit=3, query_filter=qfilter)
-        points = [r for r in result if getattr(r, 'score', 0) >= 0.85]
+        
+        points = services.qdrant_search(
+            collection='error_solutions', 
+            vector=None, 
+            limit=3, 
+            query_filter=qfilter,
+            text_query=embed_input
+        )
 
         if len(points) > 0:
-            logger.info(f"Found {len(points)} matching vectors")
-            llmresponse = services.call_llm(services.incoming_payload.get('code',''), services.masked_errordescription)
+
+            logger.info(f"Found {len(points)} matching vectors (Context for LLM)")
+            
+            # Extract context strings from the points
+            # We use the existing helper function which formats them nicely
+            context_text = extract_solutions_from_points(points)
+            
+            # Call LLM with the retrieved context (RAG)
+            llmresponse = services.call_llm(
+                services.incoming_payload.get('code',''), 
+                services.masked_errordescription,
+                context=context_text
+            )
+            
             new_id = db_insert(llmresponse)
             solutions = extract_solutions_from_points(points)
             email_payload = {

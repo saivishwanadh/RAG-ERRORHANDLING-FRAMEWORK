@@ -39,7 +39,7 @@ class Config:
     # Qdrant / Vector DB
     QDRANT_URL = os.getenv("QDRANT_URL")
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-    
+    QDRANT_DEFAULT_COLLECTION = os.getenv("QDRANT_DEFAULT_COLLECTION", "error_solutions")
     # LLM / Embedding
     HUGGINGFACE_APIKEY = os.getenv("HUGGINGFACE_APIKEY")
     GEMINI_APIKEY = os.getenv("GEMINI_APIKEY")

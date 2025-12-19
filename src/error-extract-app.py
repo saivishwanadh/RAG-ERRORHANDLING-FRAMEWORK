@@ -11,8 +11,8 @@ import pika
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from structuraldb import DB
-from config import Config
+from src.structuraldb import DB
+from src.config import Config
 
 # Setup logging
 logger = logging.getLogger(__name__)
