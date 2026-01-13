@@ -218,7 +218,7 @@ class EmailService:
         msg.set_content("This is an HTML email. Your client does not support HTML.")
         msg.add_alternative(html_body, subtype="html")
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as s:
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=Config.SMTP_TIMEOUT) as s:
             s.ehlo()
             s.starttls()
             s.ehlo()

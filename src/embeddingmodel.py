@@ -16,7 +16,7 @@ class EmbeddingGenerator:
 
         self.embeddings = GoogleGenerativeAIEmbeddings(
             google_api_key=self.api_key,
-            model="models/text-embedding-004"
+            model=Config.GEMINI_EMBEDDING_MODEL
         )
         logger.info("Initialized EmbeddingGenerator with LangChain GoogleGenerativeAIEmbeddings")
 

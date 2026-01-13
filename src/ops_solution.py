@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 import json
 from typing import Dict, Any, Optional
 import os
@@ -242,3 +243,51 @@ async def update_vector(
     )
     
     return {"message": "Vector DB updated successfully", "status": "SUCCESS"}
+
+class SolutionIngestRequest(BaseModel):
+    error_code: str
+    description: str
+    solution: str
+
+@app.post("/ingest-solution")
+async def ingest_solution(
+    item: SolutionIngestRequest,
+    embed_gen: EmbeddingGenerator = Depends(get_embedding_generator),
+    store: QdrantStore = Depends(get_vector_store)
+):
+    """
+    Manual endpoint to ingest verified solutions directly into Vector DB.
+    """
+    try:
+        # Generate a unique integer ID from UUID for Qdrant (which expects int/uuid)
+        # Using simple integer hash of uuid to fit standard int if needed, 
+        # but Qdrant supports UUID strings directly if using models.PointStruct(id="uuid", ...).
+        # However, our QdrantStore wrapper implies ID. Let's use a large random int.
+        import random
+        # 64-bit integer range
+        new_id = random.randint(0, 10_000_000_000) 
+        
+        clean_desc = clean_error_description(item.description)
+        embed_input = f"Error:{item.error_code} Description:{clean_desc.get('cleanText', '')}"
+        
+        # Generate Embedding
+        raw_embedding_input = embed_gen.get_embedding(embed_input)
+        
+        # Upsert
+        store.upsert_vector(
+            collection="error_solutions",
+            vector_id=new_id,
+            vector=raw_embedding_input,
+            payload={
+                "error_code": item.error_code,
+                "error_description": item.description,
+                "solution": item.solution
+            }
+        )
+        
+        logger.info(f"Manually ingested solution for {item.error_code} (ID: {new_id})")
+        return {"status": "SUCCESS", "message": "Solution ingested", "id": new_id}
+        
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

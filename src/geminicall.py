@@ -33,10 +33,12 @@ class GeminiClient:
         logger.info(f"Initialized GeminiClient (LangChain) with model: {self.model}")
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
-        """Extract JSON from response"""
+        """Extract JSON from response, handling potential trailing commas"""
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             candidate = match.group(0).strip()
+            # Remove trailing commas like ", }" or ", ]"
+            candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
             try:
                 return json.loads(candidate)
             except json.JSONDecodeError as e:

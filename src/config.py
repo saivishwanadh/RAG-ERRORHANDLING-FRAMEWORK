@@ -41,7 +41,6 @@ class Config:
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
     QDRANT_DEFAULT_COLLECTION = os.getenv("QDRANT_DEFAULT_COLLECTION", "error_solutions")
     # LLM / Embedding
-    HUGGINGFACE_APIKEY = os.getenv("HUGGINGFACE_APIKEY")
     GEMINI_APIKEY = os.getenv("GEMINI_APIKEY")
     GEMINI_URL = os.getenv("GEMINI_URL")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL")
@@ -52,6 +51,16 @@ class Config:
     SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
     SMTP_USERNAME = os.getenv("SMTP_USERNAME")
     SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+    SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "30"))
+
+    # Configurable Limits
+    GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
+    PRESIDIO_SCORE_THRESHOLD = float(os.getenv("PRESIDIO_SCORE_THRESHOLD", "0.8"))
+    HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
+    HTTP_POOL_SIZE = int(os.getenv("HTTP_POOL_SIZE", "10"))
+    RABBIT_RETRIES = int(os.getenv("RABBIT_RETRIES", "3"))
+    RABBIT_RETRY_DELAY = int(os.getenv("RABBIT_RETRY_DELAY", "2"))
+    RABBIT_CONNECTION_TIMEOUT = int(os.getenv("RABBIT_CONNECTION_TIMEOUT", "10"))
     
     @classmethod
     def validate(cls):

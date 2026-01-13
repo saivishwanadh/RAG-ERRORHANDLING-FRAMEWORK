@@ -135,7 +135,7 @@ class ServiceContainer:
         logger.info("Initializing services...")
         Config.validate()
 
-        # Embedding - Init first as it's needed for Qdrant
+        # Embedding
         try:
             self.embed_gen = EmbeddingGenerator(api_key=Config.GEMINI_APIKEY)
             logger.info("Embedding generator initialized")
@@ -145,7 +145,6 @@ class ServiceContainer:
 
         # Qdrant
         try:
-            # Pass embedding model to QdrantStore
             self.store = QdrantStore(embedding_model=self.embed_gen.embeddings)
             logger.info("Qdrant initialized")
         except Exception as e:
@@ -209,17 +208,11 @@ class ServiceContainer:
 
     # qdrant search wrapper
     @retry(exceptions=(Exception,), max_attempts=3)
-    def qdrant_search(self, collection: str, vector, limit: int = 3, query_filter=None, text_query: Optional[str] = None):
+    def qdrant_search(self, collection: str, vector, limit: int = 3, query_filter=None):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
         try:
-            res = self.store.search(
-                collection=collection, 
-                vector=vector, 
-                limit=limit, 
-                query_filter=query_filter,
-                text_query=text_query
-            )
+            res = self.store.search(collection=collection, vector=vector, limit=limit, query_filter=query_filter)
             self.cb_qdrant.record_success()
             return res
         except Exception as e:
@@ -232,7 +225,6 @@ class ServiceContainer:
         if self.cb_llm.is_open():
             raise Exception("LLM circuit open")
         try:
-            # Pass context to GeminiClient
             res = self.client.analyze_error(error_code, description, context=context)
             self.cb_llm.record_success()
             return res
@@ -265,7 +257,7 @@ class ServiceContainer:
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3)
-    def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict, text_content: Optional[str] = None):
+    def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
 
@@ -274,8 +266,7 @@ class ServiceContainer:
                 collection=collection,
                 vector_id=vector_id,
                 vector=vector,
-                payload=payload,
-                text_content=text_content
+                payload=payload
             )
             self.cb_qdrant.record_success()
             return True
@@ -377,26 +368,8 @@ def db_insert(llmresponse: dict):
     else:
         new_id = None
 
-    # embedding -> qdrant (best-effort)
-    try:
-        # LangChain handles embedding automatically if we pass text
-        embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
-        
-        # We pass text_content for automatic embedding generation by LangChain-Qdrant
-        services.qdrant_upsert(
-            collection='error_solutions',
-            vector_id=new_id,
-            vector=None, # Not needed for LangChain path
-            payload={
-                'error_code': services.incoming_payload.get('code',''),
-                'error_description': cleanErr.get('cleanText',''),
-                'solution': llmresponse
-            },
-            text_content=embed_input
-        )
-        logger.info("Stored vector embedding (managed by LangChain)")
-    except Exception:
-        logger.exception("Failed to store vector embedding (non-fatal)")
+
+
 
     return new_id
 
@@ -441,59 +414,64 @@ def main():
 
     rows = services.db_execute(sql, params, fetch=True)
     if rows and len(rows) > 0:
-        logger.info("Found in structural DB")
-        llmresponse = json.loads(rows[0].get('llm_solution'))
-        new_id = db_insert(llmresponse)
         solutions = rows[0].get('ops_solution')
-        email_payload = {
-            'serviceName': services.incoming_payload.get('applicationName'),
-            'environment': 'Non Prod',
-            'timestamp': services.error_ts_str,
-            'errorType': services.incoming_payload.get('code'),
-            'errorMessage': services.incoming_payload.get('description'),
-            'errorId': str(new_id),
-            'sessionId': services.sessionid,
-            'rootCause': llmresponse.get('rootCause','N/A'),
-            'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
-            'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
-            'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
-            'confirmedSolutions': solutions or ''
-        }
-        send_formatted_email(email_payload, 'databasesol-main-ui.html')
-        return
+        if solutions:
+            logger.info("Found verified solution in structural DB")
+            # If we have a verified solution, use it.
+            # We don't need to re-insert into DB or call LLM.
+            # Just send the email.
+            
+            # Note: We need to load the ORIGINAL LLM response to populate the template fully,
+            # or we can pass empty LLM fields if we only care about the confirmed solution.
+            # The original code re-inserted a new row for every occurrence, which is good for tracking freq.
+            
+            llm_str = rows[0].get('llm_solution')
+            llmresponse = json.loads(llm_str) if llm_str else {}
+            
+            new_id = db_insert(llmresponse)
+            
+            email_payload = {
+                'serviceName': services.incoming_payload.get('applicationName'),
+                'environment': 'Non Prod',
+                'timestamp': services.error_ts_str,
+                'errorType': services.incoming_payload.get('code'),
+                'errorMessage': services.incoming_payload.get('description'),
+                'errorId': str(new_id),
+                'sessionId': services.sessionid,
+                'rootCause': llmresponse.get('rootCause','N/A'),
+                'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
+                'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
+                'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
+                'confirmedSolutions': solutions
+            }
+            send_formatted_email(email_payload, 'databasesol-main-ui.html')
+            return
+        else:
+             logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
 
     # vector path
     logger.info("Checking vector DB")
     try:
         cleanErr = clean_error_description(services.masked_errordescription)
         embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
-        
-        # Use text query - LangChain handles embedding
+        raw_embedding = services.embed_gen.get_embedding(embed_input)
+
         qfilter = models.Filter(must=[models.FieldCondition(key='error_code', match=models.MatchValue(value=services.incoming_payload.get('code')))])
-        
-        points = services.qdrant_search(
-            collection='error_solutions', 
-            vector=None, 
-            limit=3, 
-            query_filter=qfilter,
-            text_query=embed_input
-        )
+        result = services.qdrant_search(collection='error_solutions', vector=raw_embedding, limit=3, query_filter=qfilter)
+        points = [r for r in result if getattr(r, 'score', 0) >= 0.85]
 
         if len(points) > 0:
-
-            logger.info(f"Found {len(points)} matching vectors (Context for LLM)")
+            logger.info(f"Found {len(points)} matching vectors")
             
-            # Extract context strings from the points
-            # We use the existing helper function which formats them nicely
+            # Restoration: Extract context and pass to LLM
             context_text = extract_solutions_from_points(points)
+            logger.info(f"Injecting context (len={len(context_text)}) into LLM prompt")
             
-            # Call LLM with the retrieved context (RAG)
             llmresponse = services.call_llm(
                 services.incoming_payload.get('code',''), 
                 services.masked_errordescription,
                 context=context_text
             )
-            
             new_id = db_insert(llmresponse)
             solutions = extract_solutions_from_points(points)
             email_payload = {

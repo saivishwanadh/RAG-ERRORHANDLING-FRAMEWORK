@@ -1,6 +1,7 @@
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
+from src.config import Config
 
 class LogSanitizer:
     def __init__(self):
@@ -84,7 +85,7 @@ class LogSanitizer:
             text=text,
             language="en",
             entities=self.ALL_ENTITIES,
-            score_threshold=0.8
+            score_threshold=Config.PRESIDIO_SCORE_THRESHOLD
         )
         anonymized_output = self.anonymizer.anonymize(
             text=text,

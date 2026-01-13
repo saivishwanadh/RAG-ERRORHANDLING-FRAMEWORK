@@ -31,12 +31,12 @@ def setup_http_session() -> requests.Session:
     if http_session is None:
         session = requests.Session()
         retry_strategy = Retry(
-            total=3,
+            total=Config.HTTP_RETRIES,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["POST"]
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=Config.HTTP_POOL_SIZE, pool_maxsize=Config.HTTP_POOL_SIZE)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         http_session = session
@@ -51,9 +51,9 @@ def setup_rabbitmq_connection():
     try:
         if rabbitmq_connection is None or rabbitmq_connection.is_closed:
             params = pika.URLParameters(Config.RABBIT_URL)
-            params.connection_attempts = 3
-            params.retry_delay = 2
-            params.socket_timeout = 10
+            params.connection_attempts = Config.RABBIT_RETRIES
+            params.retry_delay = Config.RABBIT_RETRY_DELAY
+            params.socket_timeout = Config.RABBIT_CONNECTION_TIMEOUT
             
             rabbitmq_connection = pika.BlockingConnection(params)
             rabbitmq_channel = rabbitmq_connection.channel()

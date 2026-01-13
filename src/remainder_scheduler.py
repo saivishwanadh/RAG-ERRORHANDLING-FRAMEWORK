@@ -149,7 +149,7 @@ def send_reminder(record: dict) -> bool:
         service.email_service.send_email(html_content, subject, to_address)
         
         logger.info(
-            f"✅ Remainder sent for ID {record['id']} "
+            f"✅ Reminder sent for ID {record['id']} "
             f"({retry_number}/{Config.MAX_RETRY_COUNT}) to {to_address}"
         )
         
