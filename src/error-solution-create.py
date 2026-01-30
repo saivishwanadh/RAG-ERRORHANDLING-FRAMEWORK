@@ -326,6 +326,7 @@ def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]):
     services.incoming_payload = payload
     services.sanitizer = services.sanitizer or LogSanitizer()
     services.masked_errordescription = services.sanitizer.sanitize(payload.get('description', ''))
+    logger.info(f"Masked Data: {services.masked_errordescription}")
     services.sessionid = str(uuid.uuid4())
     logger.info(f"Processing: App={payload.get('applicationName')} Code={payload.get('code')} Session={services.sessionid}")
 

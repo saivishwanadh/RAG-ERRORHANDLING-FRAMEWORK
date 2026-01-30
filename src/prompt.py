@@ -6,13 +6,24 @@ class PromptBuilder:
         self.PLATFORM_CONFIGS = {
             "mulesoft": {
                 "PLATFORM_NAME": "MuleSoft",
-                "PLATFORM_DOCS_URL": "https://docs.mulesoft.com/",
+                "PLATFORM_DOCS_URL": "https://docs.amulesoft.com/",
                 "PLATFORM_TERMS": "Anypoint Platform, DataWeave, Connectors, Runtimes",
                 "TONE": (
                     "Technical expert, Actionable, Production-Safe, Concise, "
                     "Context-Aware, Human Understandable, professional, "
                     "mulesoft mentor/trainer/architect, trouble shooter, "
                     "mulesoft support engineer, mulesoft strategic engineer"
+                )
+            },
+            "tibco": {
+                "PLATFORM_NAME": "TIBCO",
+                "PLATFORM_DOCS_URL": "https://docs.tibco.com/",
+                "PLATFORM_TERMS": "BusinessWorks, EMS, Hawk, ActiveMatrix, FTL, TIBCO Designer",
+                "TONE": (
+                    "Technical expert, Actionable, Production-Safe, Concise, "
+                    "Context-Aware, Human Understandable, professional, "
+                    "TIBCO mentor/trainer/architect, trouble shooter, "
+                    "TIBCO support engineer, TIBCO strategic engineer"
                 )
             }
         }
