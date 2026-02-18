@@ -40,6 +40,9 @@ class LogSanitizer:
             
             # Certificates
             ("CERTIFICATE", r"-----BEGIN\s+CERTIFICATE-----[\s\S]+?-----END\s+CERTIFICATE-----", 0.95),
+            
+            # IP Addresses (private + public ranges - Presidio default misses private IPs)
+            ("IP_ADDRESS", r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?::\d{1,5})?\b", 0.95),
         ]
 
         for entity, regex, score in custom_patterns:
@@ -52,15 +55,12 @@ class LogSanitizer:
 
       
         # Define all entities (built-in + custom)
+        # Note: IN_* entities removed - Presidio has no English recognizers for them
         self.ALL_ENTITIES = [
             # Built-in / Global
             "PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "IP_ADDRESS", "LOCATION", "URL",
-            "CREDIT_CARD", "DATE_TIME", "IBAN_CODE", "US_SSN", "US_BANK_NUMBER",
+            "CREDIT_CARD", "US_SSN", "US_BANK_NUMBER",
             "US_DRIVER_LICENSE", "US_PASSPORT", "US_ITIN",
-
-            # India-specific
-            "IN_AADHAAR", "IN_PAN", "IN_PASSPORT", "IN_VOTER",
-            "IN_GSTIN", "IN_VEHICLE_REGISTRATION",
 
             # Custom
             "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AZURE_KEY", "GCP_KEY",
