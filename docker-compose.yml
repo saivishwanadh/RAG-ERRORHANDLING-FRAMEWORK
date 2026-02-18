@@ -10,15 +10,19 @@ services:
       - "8000:8000"
     env_file: .env
     restart: always
+    dns:
+      - 8.8.8.8
 
   extractor:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: extractor
-    command: [ "python", "src/error-extract-app.py" ]
+    command: [ "python", "src/email-extract-app.py" ]
     env_file: .env
     restart: always
+    dns:
+      - 8.8.8.8
 
   scheduler:
     build:
@@ -28,6 +32,8 @@ services:
     command: [ "python", "src/remainder_scheduler.py" ]
     env_file: .env
     restart: always
+    dns:
+      - 8.8.8.8
 
   consumer:
     build:
@@ -37,3 +43,5 @@ services:
     command: [ "python", "src/error-solution-create.py" ]
     env_file: .env
     restart: always
+    dns:
+      - 8.8.8.8
