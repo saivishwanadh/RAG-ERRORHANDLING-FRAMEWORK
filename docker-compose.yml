@@ -18,7 +18,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: extractor
-    command: [ "python", "src/error-extract-app.py" ]
+    command: [ "python", "src/email-extract-app.py" ]
     env_file: .env
     restart: always
     dns:

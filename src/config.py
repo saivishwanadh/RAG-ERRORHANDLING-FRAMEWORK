@@ -53,14 +53,28 @@ class Config:
     SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
     SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "30"))
 
+    # Email / Graph API Configuration
+    AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "169d0c24-bd19-4708-b884-43e1622d5d0d")
+    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "DeN8Q~nhihgPgUS5oQ_baG.-b4LIMkIyHAKZ8co8")
+    AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID", "your-tenant-id")
+    AZURE_TARGET_EMAIL = os.getenv("AZURE_TARGET_EMAIL", "kishore.madirgav@prowesssoft.com")
+    
+    EMAIL_FOLDER = os.getenv("EMAIL_FOLDER", "Inbox")
+    EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "60"))
+    EMAIL_SUBJECT_FILTER = os.getenv("EMAIL_SUBJECT_FILTER", "Exception")
+
     # Configurable Limits
-    GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
+    GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/embedding-001")
     PRESIDIO_SCORE_THRESHOLD = float(os.getenv("PRESIDIO_SCORE_THRESHOLD", "0.8"))
     HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
     HTTP_POOL_SIZE = int(os.getenv("HTTP_POOL_SIZE", "10"))
     RABBIT_RETRIES = int(os.getenv("RABBIT_RETRIES", "3"))
     RABBIT_RETRY_DELAY = int(os.getenv("RABBIT_RETRY_DELAY", "2"))
     RABBIT_CONNECTION_TIMEOUT = int(os.getenv("RABBIT_CONNECTION_TIMEOUT", "10"))
+    
+    # Email sender filter - only process emails from this address
+    EMAIL_SENDER_FILTER = os.getenv("EMAIL_SENDER_FILTER", "veerlapatisaivishwanadh@prowesssoft.com")
+
     
     @classmethod
     def validate(cls):
