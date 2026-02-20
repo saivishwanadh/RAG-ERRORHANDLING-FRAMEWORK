@@ -11,14 +11,13 @@ password = "shzjkthwnrngkgnb"
 to_email = "kishore.madirgav@prowesssoft.com"
 
 # ========== Dynamic Values ==========
-exception_id = "cb13c23e-0aec62e8-03b44547-b98e8121"
-timestamp = "2026-02-18T08:16:35Z"
+exception_id = "b8122c9a-4e1a90fd-10b88d22-cc7a210e"
+timestamp = "2026-02-20T10:25:09Z"
 error_level = "Fatal"
-msg_code = "SMTP-AUTH-550"
-error_message = "Failed to send alert email"
-error_dump = "Email delivery failure while sending incident alert to operations.team@company.com. Primary recipient: john.smith@company.com. CC: sarah.jones@internal.org, mike.wilson@vendor.com. SMTP server 192.168.5.10 rejected connection attempt from application host 10.10.0.5 due to authentication failure (550 5.7.1 Relaying denied). Retry attempts exhausted after 3 attempts."
-
-
+msg_code = "DB-CONN-REFUSED"
+error_message = "Database connection refused"
+error_dump = "TIBCO BW process failed to connect to Oracle database at 10.20.5.77:1521 from application host 10.10.0.5. Connection refused by listener. Service owner notified at db.admin@company.com. Impacted user session: anita.sharma@company.com."
+engine_name = "TIBCO BW 6.5.0"
 # ========== Email HTML Template ==========
 html_content = f"""
 <html>
@@ -70,7 +69,7 @@ td {{
 <td class="label">Project Name</td><td>Aboutyou-Shared-EMEA_root</td></tr>
 
 <tr><td class="label">Timestamp UTC</td><td>{timestamp}</td>
-<td class="label">Engine Name</td><td>Aboutyou-Shared-EMEA-LB-esb14</td></tr>
+<td class="label">Engine Name</td><td>{engine_name}</td></tr>
 </table>
 
 <div class="section-title">DOCUMENT DETAILS</div>

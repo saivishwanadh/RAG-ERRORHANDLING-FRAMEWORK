@@ -115,9 +115,31 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         if exception_id:
             correlation_id = exception_id
 
+        # --- Extract fields from HTML tables ---
+        project_name = get_cell_after_label("Project Name")
+        if project_name:
+            app_name = project_name
+
+        exception_id = get_cell_after_label("Exception ID")
+        if exception_id:
+            correlation_id = exception_id
+
         msg_code = get_cell_after_label("Message Code")
         if msg_code:
             error_code = msg_code
+
+        # Timestamp Extraction
+        timestamp_str = get_cell_after_label("Timestamp UTC")
+        if timestamp_str:
+            try:
+                # Parse ISO format e.g. 2026-02-18T05:16:35Z
+                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                email_timestamp = dt.timestamp()
+            except ValueError:
+                logger.warning(f"Failed to parse timestamp '{timestamp_str}', using current time")
+                email_timestamp = datetime.now(timezone.utc).timestamp()
+        else:
+            email_timestamp = datetime.now(timezone.utc).timestamp()
 
         # --- Build description: Message + ERROR DUMP ---
         message_text = get_cell_after_label("Message")
@@ -144,7 +166,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
 
     logger.info(
         f"Parsed email: app={app_name}, correlationId={correlation_id}, "
-        f"code={error_code}, desc_len={len(description)}"
+        f"code={error_code}, timestamp={email_timestamp}, desc_len={len(description)}"
     )
 
     return {
@@ -152,7 +174,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         "correlationId": correlation_id,
         "code": error_code,
         "description": description,
-        "timestamp": datetime.now(timezone.utc).timestamp(),
+        "timestamp": email_timestamp,
         "source": "email"
     }
 
@@ -347,7 +369,7 @@ def process_email_cycle():
                     mark_email_read(email['id'], "", token)
                     continue
 
-                # Publish
+                # Publish (Critical Step)
                 if rabbitmq_channel:
                     logger.info(f"Publishing: {payload['applicationName']}, {payload['code']}, {payload['description']}, {error_timestamp}")
                     rabbitmq_channel.basic_publish(
@@ -361,10 +383,12 @@ def process_email_cycle():
                     )
                     published += 1
                     logger.info(f"✅ Published: {payload['code']}")
-                
-                # Mark as read
-                mark_email_read(email['id'], "", token)
-                processed += 1
+                    
+                    # Mark as read ONLY after successful publish
+                    mark_email_read(email['id'], "", token)
+                    processed += 1
+                else:
+                    logger.error(f"❌ RabbitMQ unavailable. Skipping publish for {payload['code']} (keeping email unread)")
                 
             except Exception as e:
                 logger.error(f"Failed to process email {email.get('id')}: {e}")
