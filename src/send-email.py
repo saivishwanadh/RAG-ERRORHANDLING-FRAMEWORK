@@ -8,15 +8,15 @@ smtp_server = "smtp.office365.com"
 smtp_port = 587
 username = "fahad.alikhan@prowesssoft.com"
 password = "shzjkthwnrngkgnb"
-to_email = "kishore.madirgav@prowesssoft.com"
+to_email = "saivishwanadh.veerlapati@prowesssoft.com"
 
 # ========== Dynamic Values ==========
-exception_id = "b8122c9a-4e1a90fd-10b88d22-cc7a210e"
-timestamp = "2026-02-20T10:25:09Z"
-error_level = "Fatal"
-msg_code = "DB-CONN-REFUSED"
-error_message = "Database connection refused"
-error_dump = "TIBCO BW process failed to connect to Oracle database at 10.20.5.77:1521 from application host 10.10.0.5. Connection refused by listener. Service owner notified at db.admin@company.com. Impacted user session: anita.sharma@company.com."
+exception_id = "e11c4d92-71b820ac-6a993ee4-9f0c18d7"
+timestamp = "2026-02-18T10:50:21Z"
+error_level = "Warn"
+msg_code = "EMS-QUEUE-DEPTH"
+error_message = "Queue depth threshold exceeded"
+error_dump = "TIBCO EMS queue ORDERS.PROCESSING exceeded configured depth limit of 5000 messages. Current depth: 7421. Broker IP 10.30.8.12. Consumer application on host 10.10.0.5 is lagging. Alert issued to messaging.support@company.com and product.owner@company.com."
 engine_name = "TIBCO BW 6.5.0"
 # ========== Email HTML Template ==========
 html_content = f"""

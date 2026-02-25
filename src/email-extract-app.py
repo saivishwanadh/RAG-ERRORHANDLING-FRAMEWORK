@@ -7,9 +7,11 @@ import sys
 import msal
 import requests
 import pika
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Optional, Tuple
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src.config import Config
@@ -28,32 +30,116 @@ rabbitmq_channel: Optional[pika.channel.Channel] = None
 scheduler: Optional[BlockingScheduler] = None
 msal_app: Optional[msal.ConfidentialClientApplication] = None
 
+# Optimization 1: Persistent DB connection — reused across all cycles (no open/close per email)
+_db_conn: Optional[psycopg2.extensions.connection] = None
+
+# In-memory cooldown tracker: { (app_name, error_code) -> last_alert_datetime }
+escalation_cooldown: Dict[tuple, datetime] = {}
+
+# Cross-cycle async gap cache: { (app_name, code, desc) → (first_published_at UTC, count) }
+# Bridges the window between "published to RabbitMQ" and "consumer inserts DB record"
+# Prevents duplicate emails arriving before consumer finishes from being re-published
+_published_cache: Dict[tuple, Tuple[datetime, int]] = {}
+
 # Graph API Configuration
 # For Client Credentials, we usually use the /.default scope
 SCOPES = ["https://graph.microsoft.com/.default"]
 
-def setup_rabbitmq_connection():
-    """Setup persistent RabbitMQ connection"""
-    global rabbitmq_connection, rabbitmq_channel
-    
+
+def get_persistent_db() -> psycopg2.extensions.connection:
+    """Return the module-level persistent DB connection, reconnecting if closed."""
+    global _db_conn
     try:
-        if rabbitmq_connection is None or rabbitmq_connection.is_closed:
-            params = pika.URLParameters(Config.RABBIT_URL)
-            params.connection_attempts = 3
-            rabbitmq_connection = pika.BlockingConnection(params)
+        if _db_conn is None or _db_conn.closed:
+            _db_conn = psycopg2.connect(Config.DB_URL)
+            logger.info("✅ Persistent DB connection established")
+    except Exception as e:
+        logger.error(f"Failed to establish persistent DB connection: {e}")
+        _db_conn = None
+        raise
+    return _db_conn
+
+
+def setup_rabbitmq_connection():
+    """
+    Setup persistent RabbitMQ connection with heartbeat.
+    - Reuses existing connection/channel if both are healthy
+    - Reconnects if connection dropped
+    - Recreates channel if connection alive but channel closed
+    """
+    global rabbitmq_connection, rabbitmq_channel
+
+    try:
+        # Check if connection is alive
+        conn_alive = (
+            rabbitmq_connection is not None
+            and not rabbitmq_connection.is_closed
+        )
+
+        # Check if channel is alive (connection can be open but channel closed)
+        channel_alive = (
+            conn_alive
+            and rabbitmq_channel is not None
+            and rabbitmq_channel.is_open
+        )
+
+        if channel_alive:
+            # Both healthy — nothing to do
+            return
+
+        if conn_alive and not channel_alive:
+            # Connection alive but channel dead — just recreate channel
+            logger.info("RabbitMQ: connection alive, recreating channel...")
             rabbitmq_channel = rabbitmq_connection.channel()
-            
             rabbitmq_channel.exchange_declare(
                 exchange=Config.EXCHANGE,
                 exchange_type=Config.EXCHANGE_TYPE,
                 durable=True
             )
             rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-            logger.info("RabbitMQ connection established")
-            
+            logger.info("RabbitMQ channel restored")
+            return
+
+        # Full reconnect needed
+        logger.info("Establishing new RabbitMQ connection...")
+        params = pika.URLParameters(Config.RABBIT_URL)
+        params.heartbeat = 120               # Heartbeat every 120s (> 60s poll interval)
+        params.blocked_connection_timeout = 30
+        params.socket_timeout = 10
+        params.connection_attempts = 3
+        params.retry_delay = 2
+
+        rabbitmq_connection = pika.BlockingConnection(params)
+        rabbitmq_channel = rabbitmq_connection.channel()
+
+        rabbitmq_channel.exchange_declare(
+            exchange=Config.EXCHANGE,
+            exchange_type=Config.EXCHANGE_TYPE,
+            durable=True
+        )
+        rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
+        logger.info("✅ RabbitMQ connection established (heartbeat=120s)")
+
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
         rabbitmq_connection = None
+        rabbitmq_channel = None  # Ensure stale channel isn't reused
+
+
+def keep_rabbitmq_alive():
+    """
+    Process pending heartbeat frames to keep the connection alive between cycles.
+    Call once at the start of each poll cycle.
+    """
+    global rabbitmq_connection, rabbitmq_channel
+    try:
+        if rabbitmq_connection and not rabbitmq_connection.is_closed:
+            rabbitmq_connection.process_data_events(time_limit=0)  # Non-blocking flush
+    except Exception as e:
+        logger.warning(f"RabbitMQ heartbeat flush failed: {e}. Will reconnect on next publish.")
+        rabbitmq_connection = None
+        rabbitmq_channel = None
+
 
 def get_graph_token() -> Optional[str]:
     """Get Access Token for Graph API (Client Credentials Flow)"""
@@ -106,16 +192,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
                         return next_td.get_text(strip=True)
             return ""
 
-        # --- Extract fields from HTML tables ---
-        project_name = get_cell_after_label("Project Name")
-        if project_name:
-            app_name = project_name
-
-        exception_id = get_cell_after_label("Exception ID")
-        if exception_id:
-            correlation_id = exception_id
-
-        # --- Extract fields from HTML tables ---
+     # --- Extract fields from HTML tables ---
         project_name = get_cell_after_label("Project Name")
         if project_name:
             app_name = project_name
@@ -178,48 +255,111 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         "source": "email"
     }
 
-def is_duplicate(app_name, code, desc, timestamp):
-    """Check duplicate using DB with description matching and configurable time window"""
+def check_occurrence_count(app_name, code, desc, timestamp) -> int:
+    """
+    Optimization 2: Single atomic UPDATE...RETURNING.
+    - If record NOT found → UPDATE affects 0 rows → return 0 (new error)
+    - If record FOUND → atomically increments occurrence_count and returns new value
+    Eliminates the separate SELECT round trip entirely.
+    """
+    global _db_conn
     try:
-        with DB() as db:
-            # Convert UTC to local if needed
-            if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
-                local_timestamp = timestamp.astimezone().replace(tzinfo=None)
-            else:
-                local_timestamp = timestamp
-            
-            query = """
-                SELECT id, error_timestamp,
-                       EXTRACT(EPOCH FROM (%s - error_timestamp)) / 60 AS minutes_ago
-                FROM errorsolutiontable
-                WHERE application_name = %s
-                  AND error_code = %s
-                  AND error_description = %s
-                  AND error_timestamp >= %s - INTERVAL '%s minutes'
-                  AND error_timestamp <= %s + INTERVAL '1 minute'
-                ORDER BY error_timestamp DESC
-                LIMIT 1
-            """
-            result = db.execute(
-                query,
-                params=(
-                    local_timestamp, app_name, code, desc,
-                    local_timestamp, Config.DB_DUPLICATE_WINDOW_MINUTES, local_timestamp
-                ),
-                fetch=True
-            )
-            
-            if result:
-                record = result[0]
-                minutes_ago = float(record["minutes_ago"])
-                logger.warning(f"⏭️ DUPLICATE: {app_name}/{code} (occurred {abs(minutes_ago):.1f}min ago)")
-                return True
-            
-            logger.info(f"✅ New error: {app_name}/{code}")
-            return False
+        conn = get_persistent_db()
+
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            local_ts = timestamp.astimezone().replace(tzinfo=None)
+        else:
+            local_ts = timestamp
+
+        sql = """
+            UPDATE errorsolutiontable
+               SET occurrence_count = occurrence_count + 1
+             WHERE application_name = %s
+               AND error_code = %s
+               AND error_description = %s
+               AND error_timestamp >= %s - INTERVAL '%s minutes'
+               AND error_timestamp <= %s + INTERVAL '1 minute'
+            RETURNING occurrence_count
+        """
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (
+                app_name, code, desc,
+                local_ts, Config.DB_DUPLICATE_WINDOW_MINUTES, local_ts
+            ))
+            rows = cur.fetchall()
+        conn.commit()
+
+        if not rows:
+            logger.debug(f"No existing record for {app_name}/{code} — new error")
+            return 0
+
+        new_count = max(int(r['occurrence_count']) for r in rows)
+        logger.info(f"📈 {app_name}/{code}: occurrence_count → {new_count}")
+        return new_count
+
     except Exception as e:
-        logger.error(f"DB Check failed: {e}")
-        return False  # Fail open
+        logger.error(f"DB occurrence count check failed: {e}")
+        try:
+            if _db_conn:
+                _db_conn.rollback()
+        except Exception:
+            pass
+        _db_conn = None  # Force reconnect next call
+        return 0  # Fail open — treat as new error
+
+
+def batch_fetch_occurrence_counts(
+    error_keys: List[Tuple[str, str, str]],
+    local_timestamps: List[datetime]
+) -> Dict[Tuple[str, str, str], int]:
+    """
+    Optimization 3: Pre-fetch occurrence counts for ALL emails in ONE query.
+    Returns { (app_name, code, description) -> current occurrence_count }
+    Reduces N per-email DB queries to a single batch SELECT at cycle start.
+    """
+    if not error_keys:
+        return {}
+    global _db_conn
+    try:
+        conn = get_persistent_db()
+
+        # Use earliest timestamp for the window lower bound
+        min_ts = min(local_timestamps)
+
+        # Build IN clause for unique (app_name, error_code) pairs
+        unique_pairs = list({(k[0], k[1]) for k in error_keys})
+        placeholders = ','.join(['(%s,%s)'] * len(unique_pairs))
+        pair_params: List = []
+        for pair in unique_pairs:
+            pair_params.extend(pair)
+
+        sql = f"""
+            SELECT application_name, error_code, error_description, occurrence_count
+              FROM errorsolutiontable
+             WHERE (application_name, error_code) IN ({placeholders})
+               AND error_timestamp >= %s - INTERVAL '{Config.DB_DUPLICATE_WINDOW_MINUTES} minutes'
+             ORDER BY error_timestamp DESC
+        """
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, pair_params + [min_ts])
+            rows = cur.fetchall()
+        conn.commit()
+
+        # Build result: keyed by (app, code, desc) — take latest record per key
+        result: Dict[Tuple[str, str, str], int] = {}
+        for row in rows:
+            key = (row['application_name'], row['error_code'], row['error_description'])
+            if key not in result:  # Already ordered DESC, first hit is most recent
+                result[key] = int(row['occurrence_count'] or 1)
+
+        logger.debug(f"Batch pre-fetch: found {len(result)}/{len(error_keys)} errors in DB")
+        return result
+
+    except Exception as e:
+        logger.error(f"Batch fetch occurrence counts failed: {e}")
+        _db_conn = None
+        return {}  # Fail open — all emails treated as new
+
 
 def deduplicate_emails(emails: List[Dict]) -> List[Dict]:
     """Remove duplicate emails within the same batch"""
@@ -247,6 +387,63 @@ def deduplicate_emails(emails: List[Dict]) -> List[Dict]:
     
     return unique
 
+def send_high_priority_alert(app_name: str, code: str, description: str, count: int, timestamp: datetime):
+    """Send a high-priority escalation email directly via SMTP, bypassing RabbitMQ."""
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        to_email = Config.HIGH_PRIORITY_TO_EMAIL or Config.TO_EMAIL
+        if not to_email:
+            logger.error("HIGH_PRIORITY_TO_EMAIL not configured. Cannot send escalation alert.")
+            return
+
+        html_body = f"""
+        <html><body style="font-family: Arial, sans-serif; color: #333;">
+        <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
+            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
+        </div>
+        <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
+            <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
+            in the last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes and requires immediate attention.</strong></p>
+            <table style="width:100%;border-collapse:collapse;margin-top:12px;">
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;width:30%;">Application</td>
+                <td style="padding:8px;border:1px solid #ddd;">{app_name}</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Error Code</td>
+                <td style="padding:8px;border:1px solid #ddd;">{code}</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Occurrences</td>
+                <td style="padding:8px;border:1px solid #ddd;color:#b0002a;font-weight:bold;">{count} times</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Time Window</td>
+                <td style="padding:8px;border:1px solid #ddd;">Last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Last Seen</td>
+                <td style="padding:8px;border:1px solid #ddd;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
+                <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
+            </table>
+            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by RAG Error Handling Framework — Escalation Engine</p>
+        </div>
+        </body></html>
+        """
+
+        msg = EmailMessage()
+        msg["Subject"] = f"🚨 HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
+        msg["From"] = Config.SMTP_USERNAME
+        msg["To"] = to_email
+        msg.set_content(f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. Check HTML version.")
+        msg.add_alternative(html_body, subtype="html")
+
+        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+            s.send_message(msg)
+
+        logger.warning(f"🚨 HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
+
+    except Exception as e:
+        logger.error(f"Failed to send high-priority alert: {e}")
+
 def mark_email_read(message_id: str, id_url: str, access_token: str):
     """Mark email as read in Graph API"""
     # Specifically for /users/{id}/messages/{id} endpoint
@@ -264,7 +461,10 @@ def process_email_cycle():
     """Main polling logic with metrics"""
     cycle_start = datetime.now()
     logger.info("Starting Email Poll Cycle (Client Credentials)...")
-    
+
+    # Optimization 5: Flush heartbeat frames to keep RabbitMQ connection alive
+    keep_rabbitmq_alive()
+
     token = get_graph_token()
     if not token:
         logger.error("Could not obtain Graph Token. Skipping cycle.")
@@ -280,25 +480,20 @@ def process_email_cycle():
     
     # Build time filter: only emails from the last POLL_INTERVAL_SECONDS seconds
     since_dt = datetime.now(timezone.utc).replace(microsecond=0)
-    from datetime import timedelta
     since_dt = since_dt - timedelta(seconds=Config.EMAIL_POLL_INTERVAL)
     since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # ISO 8601 UTC for OData
-    
-    # Filter: unread + received in last poll window
-    # Note: Filtering by 'from' + 'receivedDateTime' + 'isRead' causes InefficientFilter error
-    # So we filter by time & status here, and filter by sender in Python
-    odata_filter = (
-        f"isRead eq false "
-        f"and receivedDateTime ge {since_str}"
-    )
-    
+
+    # FIX 1: Poll ALL emails (read + unread) in the 60s window
+    # We do NOT filter isRead — the sliding time window prevents re-processing
+    odata_filter = f"receivedDateTime ge {since_str}"
+
     params = {
         '$filter': odata_filter,
         '$top': 50,
         '$select': 'id,subject,body,receivedDateTime,from',
         '$orderby': 'receivedDateTime desc'
     }
-    logger.info(f"Polling unread emails since {since_str}")
+    logger.info(f"Polling ALL emails (read+unread) since {since_str}")
     
     # Metrics
     processed = 0
@@ -314,82 +509,192 @@ def process_email_cycle():
             
         emails = resp.json().get('value', [])
         if not emails:
-            logger.info("No unread emails.")
+            logger.info("No emails in the last poll window.")
             return
 
-        # 1. Deduplicate batch
-        unique_emails = deduplicate_emails(emails)
-        
-        # 2. Filter by Sender (Python side)
+        # FIX 2: No batch deduplication — each email increments occurrence_count individually
+        # This ensures 3 identical error emails correctly count as 3 occurrences
+        # Filter by Sender (Python side)
         target_sender = Config.EMAIL_SENDER_FILTER.lower()
         filtered_emails = []
-        
-        for email in unique_emails:
+
+        for email in emails:
             sender = email.get('from', {}).get('emailAddress', {}).get('address', '').lower()
             if sender == target_sender:
                 filtered_emails.append(email)
             else:
                 logger.debug(f"Skipping email from '{sender}' (not {target_sender})")
-        
+
         if not filtered_emails:
-            logger.info(f"Found {len(emails)} unread, but NONE from {target_sender}.")
+            logger.info(f"Found {len(emails)} emails, but NONE from {target_sender}.")
             return
 
         logger.info(f"Found {len(filtered_emails)} matching emails from {target_sender}")
-        
+
         setup_rabbitmq_connection()
 
+        # ── Optimization 3: Pre-parse all emails, then batch-fetch DB state in ONE query ──
+        parsed_batch: List[Tuple[Dict, Dict, datetime]] = []
         for email in filtered_emails:
+            body_content = email.get('body', {}).get('content', '')
+            subject = email.get('subject', '')
+            payload = parse_tibco_email(body_content, subject)
+
+            if not all([payload.get('applicationName'), payload.get('code'), payload.get('description')]):
+                logger.warning(f"⚠️ Skipping email with missing fields: {email.get('id')}")
+                skipped_invalid += 1
+                continue
+
             try:
-                # Extract body
-                body_content = email.get('body', {}).get('content', '')
-                subject = email.get('subject', '')
-                
-                payload = parse_tibco_email(body_content, subject)
-                
-                # Validate required fields
-                if not all([payload.get('applicationName'), payload.get('code'), payload.get('description')]):
-                    logger.warning(f"⚠️ Skipping email with missing fields: {email.get('id')}")
-                    skipped_invalid += 1
-                    mark_email_read(email['id'], "", token)
-                    continue
-                
-                # Convert timestamp
-                try:
-                    error_timestamp = datetime.fromtimestamp(payload['timestamp'], tz=timezone.utc)
-                except (ValueError, OSError, TypeError) as e:
-                    logger.error(f"❌ Invalid timestamp {payload['timestamp']}: {e}")
-                    skipped_invalid += 1
-                    mark_email_read(email['id'], "", token)
-                    continue
-                
-                # Check Deduplicate
-                if is_duplicate(payload['applicationName'], payload['code'], payload['description'], error_timestamp):
+                error_timestamp = datetime.fromtimestamp(payload['timestamp'], tz=timezone.utc)
+            except (ValueError, OSError, TypeError) as e:
+                logger.error(f"❌ Invalid timestamp {payload['timestamp']}: {e}")
+                skipped_invalid += 1
+                continue
+
+            parsed_batch.append((email, payload, error_timestamp))
+
+        if not parsed_batch:
+            logger.info("No valid emails after parsing.")
+            return
+
+        # ONE batch DB query for all error keys — Optimization 3
+        all_keys = [(p['applicationName'], p['code'], p['description']) for _, p, _ in parsed_batch]
+        all_ts = [
+            ts.astimezone().replace(tzinfo=None) if ts.tzinfo else ts
+            for _, _, ts in parsed_batch
+        ]
+        prefetched_counts = batch_fetch_occurrence_counts(all_keys, all_ts)
+        logger.info(
+            f"Batch pre-fetch: {len(prefetched_counts)} known errors, "
+            f"{len(set(all_keys)) - len(prefetched_counts)} new"
+        )
+
+        # Within-cycle tracker: catches duplicates before consumer inserts to DB
+        within_cycle_counts: Dict[tuple, int] = {}
+
+        for email, payload, error_timestamp in parsed_batch:
+            try:
+                # --- Within-cycle deduplication (catches same-batch duplicates) ---
+                cycle_key = (payload['applicationName'], payload['code'], payload['description'])
+                if cycle_key in within_cycle_counts:
+                    within_cycle_counts[cycle_key] += 1
+                    cycle_count = within_cycle_counts[cycle_key]
+                    logger.info(f"⏭️ Same-cycle duplicate: {payload['code']} (#{cycle_count} this cycle)")
+                    # Still update DB occurrence_count so threshold tracking is accurate
+                    check_occurrence_count(
+                        payload['applicationName'], payload['code'],
+                        payload['description'], error_timestamp
+                    )
                     skipped_duplicate += 1
-                    mark_email_read(email['id'], "", token)
                     continue
 
-                # Publish (Critical Step)
-                if rabbitmq_channel:
-                    logger.info(f"Publishing: {payload['applicationName']}, {payload['code']}, {payload['description']}, {error_timestamp}")
-                    rabbitmq_channel.basic_publish(
-                        exchange=Config.EXCHANGE,
-                        routing_key=Config.ROUTING_KEY,
-                        body=json.dumps(payload),
-                        properties=pika.BasicProperties(
-                            delivery_mode=2,
-                            content_type='application/json'
+                # ── 3-Layer Decision ──────────────────────────────────────────────────
+                # Layer 1: DB check — atomic UPDATE RETURNING
+                count = check_occurrence_count(
+                    payload['applicationName'], payload['code'],
+                    payload['description'], error_timestamp
+                )
+
+                now_utc = datetime.now(timezone.utc)
+                cache_ttl = timedelta(minutes=Config.DB_DUPLICATE_WINDOW_MINUTES)
+
+                if count > 0:
+                    # ✅ DB has the record — source of truth
+                    # Clean up in-memory cache (consumer has inserted, cache no longer needed)
+                    _published_cache.pop(cycle_key, None)
+
+                elif count == 0:
+                    # DB has no record yet — could be:
+                    #   (a) Brand-new error  OR
+                    #   (b) Async gap: we already published but consumer hasn't inserted yet
+
+                    # Layer 2: Check in-memory published cache
+                    cache_entry = _published_cache.get(cycle_key)
+                    if cache_entry:
+                        pub_time, mem_count = cache_entry
+                        age = now_utc - pub_time
+
+                        if age > cache_ttl:
+                            # Cache entry expired — treat as a fresh new error
+                            logger.info(
+                                f"🔄 Cache expired for {payload['code']} "
+                                f"({age.total_seconds()/60:.1f}min > {Config.DB_DUPLICATE_WINDOW_MINUTES}min TTL). "
+                                f"Treating as new."
+                            )
+                            _published_cache.pop(cycle_key, None)
+                            # count stays 0 → will publish below
+                        else:
+                            # ⚠️ Async gap duplicate — consumer hasn't inserted yet
+                            mem_count += 1
+                            _published_cache[cycle_key] = (pub_time, mem_count)
+                            count = mem_count
+                            logger.info(
+                                f"⏳ Async gap duplicate: {payload['code']} "
+                                f"(in-memory count={mem_count}, DB not yet updated by consumer)"
+                            )
+
+                # Register in cycle tracker
+                within_cycle_counts[cycle_key] = max(count, 1)
+
+                # ── Act on final count ────────────────────────────────────────────────
+                if count == 0:
+                    # Brand new error — publish to RabbitMQ
+                    logger.info(f"✅ New error: {payload['applicationName']}/{payload['code']}")
+                    if rabbitmq_channel:
+                        rabbitmq_channel.basic_publish(
+                            exchange=Config.EXCHANGE,
+                            routing_key=Config.ROUTING_KEY,
+                            body=json.dumps(payload),
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
                         )
+                        # Register in cross-cycle cache immediately
+                        _published_cache[cycle_key] = (now_utc, 1)
+                        published += 1
+                        logger.info(f"✅ Published: {payload['code']} | Cached for async gap protection")
+                        processed += 1
+                    else:
+                        logger.error(f"❌ RabbitMQ unavailable. Will retry next cycle.")
+
+                elif count < Config.HIGH_PRIORITY_THRESHOLD:
+                    # Known duplicate (DB or in-memory) — skip silently
+                    logger.info(
+                        f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
+                        f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                     )
-                    published += 1
-                    logger.info(f"✅ Published: {payload['code']}")
-                    
-                    # Mark as read ONLY after successful publish
-                    mark_email_read(email['id'], "", token)
-                    processed += 1
+                    skipped_duplicate += 1
+
                 else:
-                    logger.error(f"❌ RabbitMQ unavailable. Skipping publish for {payload['code']} (keeping email unread)")
-                
+                    # count >= HIGH_PRIORITY_THRESHOLD — escalate!
+                    error_key = (payload['applicationName'], payload['code'])
+                    last_alert = escalation_cooldown.get(error_key)
+                    cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+
+                    if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                        logger.warning(
+                            f"🚨 ESCALATION TRIGGERED: {payload['applicationName']}/{payload['code']} "
+                            f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                        )
+                        send_high_priority_alert(
+                            app_name=payload['applicationName'],
+                            code=payload['code'],
+                            description=payload['description'],
+                            count=count,
+                            timestamp=error_timestamp
+                        )
+                        escalation_cooldown[error_key] = now_utc
+                    else:
+                        minutes_since = (now_utc - last_alert).total_seconds() / 60
+                        logger.info(
+                            f"⏸️ Escalation cooldown active for {payload['code']} "
+                            f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
+                        )
+
+                    skipped_duplicate += 1
+
             except Exception as e:
                 logger.error(f"Failed to process email {email.get('id')}: {e}")
 

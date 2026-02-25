@@ -349,8 +349,8 @@ def db_insert(llmresponse: dict):
     insert_sql = """
         INSERT INTO errorsolutiontable (
             application_name, error_code, error_description, sessionID,
-            llm_solution, error_timestamp, sessionid_status
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            llm_solution, error_timestamp, sessionid_status, occurrence_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     params = (
         services.incoming_payload.get('applicationName'),
@@ -359,7 +359,8 @@ def db_insert(llmresponse: dict):
         services.sessionid,
         json.dumps(llmresponse),
         services.error_ts_str,
-        'active'
+        'active',
+        1  # First occurrence always starts at 1
     )
 
     inserted_rows = services.db_execute(insert_sql, params, fetch=True)
@@ -373,6 +374,7 @@ def db_insert(llmresponse: dict):
 
 
     return new_id
+
 
 
 # extract solutions

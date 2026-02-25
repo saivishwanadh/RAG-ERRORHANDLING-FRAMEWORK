@@ -75,6 +75,11 @@ class Config:
     # Email sender filter - only process emails from this address
     EMAIL_SENDER_FILTER = os.getenv("EMAIL_SENDER_FILTER", "veerlapatisaivishwanadh@prowesssoft.com")
 
+    # High-Priority Escalation
+    HIGH_PRIORITY_THRESHOLD = int(os.getenv("HIGH_PRIORITY_THRESHOLD", "5"))  # occurrences before escalation
+    ESCALATION_COOLDOWN_MINUTES = int(os.getenv("ESCALATION_COOLDOWN_MINUTES", "60"))  # min gap between repeat alerts
+    HIGH_PRIORITY_TO_EMAIL = os.getenv("HIGH_PRIORITY_TO_EMAIL", "")
+
     
     @classmethod
     def validate(cls):
