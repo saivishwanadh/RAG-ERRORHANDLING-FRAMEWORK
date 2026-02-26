@@ -31,10 +31,23 @@ class Config:
     DLQ_ENABLED=os.getenv("DLQ_ENABLED")
     DLX_EXCHANGE=os.getenv("DLX_EXCHANGE")
     DLQ_ROUTING_KEY=os.getenv("DLQ_ROUTING_KEY")
-    # ELK
+    # ELK (legacy — kept for backward compatibility)
     ELK_SEARCH_URL = os.getenv("ELK_SEARCH_URL")
     ELK_APIKEY = os.getenv("ELK_APIKEY")
     ELK_TIMEOUT = int(os.getenv("ELK_TIMEOUT_SECONDS", "30"))
+
+    # OpenSearch / Elasticsearch
+    OPENSEARCH_URL      = os.getenv("OPENSEARCH_URL", "http://localhost:9200")
+    OPENSEARCH_INDEX    = os.getenv("OPENSEARCH_INDEX", "ceva-logs")
+    OPENSEARCH_APIKEY   = os.getenv("OPENSEARCH_APIKEY", "")          # API Key auth (optional)
+    OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME", "")        # Basic auth (optional)
+    OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "")        # Basic auth (optional)
+    OPENSEARCH_VERIFY_SSL           = os.getenv("OPENSEARCH_VERIFY_SSL", "false").lower() == "true"
+    OPENSEARCH_TIMEOUT              = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
+    OPENSEARCH_BATCH_SIZE           = int(os.getenv("OPENSEARCH_BATCH_SIZE", "100"))
+    OPENSEARCH_LOG_LEVEL_FILTER     = os.getenv("OPENSEARCH_LOG_LEVEL_FILTER", "ERROR")
+    OPENSEARCH_ERROR_CODE_REGEX     = os.getenv("OPENSEARCH_ERROR_CODE_REGEX", "")
+    OPENSEARCH_ENRICH_DESCRIPTION   = os.getenv("OPENSEARCH_ENRICH_DESCRIPTION", "false").lower() == "true"
     
     # Qdrant / Vector DB
     QDRANT_URL = os.getenv("QDRANT_URL")
@@ -54,10 +67,10 @@ class Config:
     SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "30"))
 
     # Email / Graph API Configuration
-    AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "169d0c24-bd19-4708-b884-43e1622d5d0d")
-    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "DeN8Q~nhihgPgUS5oQ_baG.-b4LIMkIyHAKZ8co8")
+    AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
+    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "")
     AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID", "your-tenant-id")
-    AZURE_TARGET_EMAIL = os.getenv("AZURE_TARGET_EMAIL", "kishore.madirgav@prowesssoft.com")
+    AZURE_TARGET_EMAIL = os.getenv("AZURE_TARGET_EMAIL", "")
     
     EMAIL_FOLDER = os.getenv("EMAIL_FOLDER", "Inbox")
     EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "60"))
@@ -71,6 +84,8 @@ class Config:
     RABBIT_RETRIES = int(os.getenv("RABBIT_RETRIES", "3"))
     RABBIT_RETRY_DELAY = int(os.getenv("RABBIT_RETRY_DELAY", "2"))
     RABBIT_CONNECTION_TIMEOUT = int(os.getenv("RABBIT_CONNECTION_TIMEOUT", "10"))
+    MAX_RETRIES_PER_MESSAGE = int(os.getenv("MAX_RETRIES_PER_MESSAGE", "2"))
+    RATE_LIMIT_DELAY = int(os.getenv("RATE_LIMIT_DELAY", "60"))
     
     # Email sender filter - only process emails from this address
     EMAIL_SENDER_FILTER = os.getenv("EMAIL_SENDER_FILTER", "veerlapatisaivishwanadh@prowesssoft.com")
@@ -85,8 +100,7 @@ class Config:
     def validate(cls):
         """Validate critical configuration is present"""
         required = [
-            'DB_URL', 'RABBIT_URL', 'EXCHANGE', 'QUEUE', 'ROUTING_KEY',
-            'ELK_SEARCH_URL', 'ELK_APIKEY'
+            'DB_URL', 'RABBIT_URL', 'EXCHANGE', 'QUEUE', 'ROUTING_KEY'
         ]
         missing = [key for key in required if not getattr(cls, key)]
         if missing:

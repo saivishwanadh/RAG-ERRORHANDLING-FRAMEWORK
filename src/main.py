@@ -35,36 +35,41 @@ def start_process(name, command, cwd=SRC_DIR):
         return None
 
 try:
-    # 1. ELK Poller
-    start_process("error-extract-app", [python, os.path.join(SRC_DIR, "error-extract-app.py")])
+    # 1. Email Extractor
+    start_process("email-extract-app", [python, os.path.join(SRC_DIR, "email-extract-app.py")])
     time.sleep(1)
-    
-    # 2. Reminder Scheduler
+
+    # 2. OpenSearch Extractor
+    start_process("opensearch-extract-app", [python, os.path.join(SRC_DIR, "opensearch-extract-app.py")])
+    time.sleep(1)
+
+    # 3. Reminder Scheduler
     start_process("remainder_scheduler", [python, os.path.join(SRC_DIR, "remainder_scheduler.py")])
     time.sleep(1)
     
-    # 3. FastAPI
+    # 4. FastAPI
     logger.info("▶️  Starting ops_solution.py (FastAPI)...")
     # Using list for command avoids shell=True
-    p3 = subprocess.Popen(
+    p4 = subprocess.Popen(
         [python, "-m", "uvicorn", "ops_solution:app", "--reload", "--host", "127.0.0.1", "--port", "8000"],
         env=env,
         cwd=SRC_DIR
     )
-    processes.append(("ops_solution FastAPI", p3))
+    processes.append(("ops_solution FastAPI", p4))
     time.sleep(2)
-    
-    # 4. Error Solution Creator
+
+    # 5. Error Solution Creator
     start_process("error-solution-create", [python, os.path.join(SRC_DIR, "error-solution-create.py")])
-    
+
     print("\n" + "=" * 60)
     logger.info("✅ All services started successfully!")
     print("=" * 60)
     print("\n📋 Running Services:")
-    print("  1. ELK Poller         → Extracts errors from ELK")
-    print("  2. Reminder Scheduler → Sends reminder emails")
-    print("  3. FastAPI (port 8000)→ http://127.0.0.1:8000")
-    print("  4. Error Processor    → Consumes RabbitMQ")
+    print("  1. Email Extractor        → Extracts errors from email")
+    print("  2. OpenSearch Extractor   → Extracts errors from OpenSearch")
+    print("  3. Reminder Scheduler     → Sends reminder emails")
+    print("  4. FastAPI (port 8000)    → http://127.0.0.1:8000")
+    print("  5. Error Processor        → Consumes RabbitMQ")
     print("\n🛑 Press CTRL+C to stop all services\n")
     print("=" * 60)
     

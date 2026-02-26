@@ -18,9 +18,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: extractor
-    command: [ "python", "src/email-extract-app.py" ]
+    command: [ "python", "src/opensearch-extract-app.py" ]
     env_file: .env
     restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Allows container to reach host's OpenSearch
     dns:
       - 8.8.8.8
 

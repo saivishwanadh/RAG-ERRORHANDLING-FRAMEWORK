@@ -21,7 +21,7 @@ class QdrantStore:
     ):
         self.url = url or Config.QDRANT_URL
         self.api_key = api_key or Config.QDRANT_API_KEY
-        self.collection_name = Config.QDRANT_DEFAULT_COLLECTION or collection_name
+        self.collection_name = collection_name or Config.QDRANT_DEFAULT_COLLECTION
         self.embedding_model = embedding_model
         
         if not self.url:

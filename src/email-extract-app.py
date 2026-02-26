@@ -192,7 +192,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
                         return next_td.get_text(strip=True)
             return ""
 
-     # --- Extract fields from HTML tables ---
+        # --- Extract fields from HTML tables ---
         project_name = get_cell_after_label("Project Name")
         if project_name:
             app_name = project_name
@@ -706,7 +706,7 @@ def process_email_cycle():
     logger.info(
         f"📊 Cycle completed in {duration:.2f}s: "
         f"total={len(emails) if 'emails' in locals() else 0}, "
-        f"unique={len(unique_emails) if 'unique_emails' in locals() else 0}, "
+        f"filtered={len(filtered_emails) if 'filtered_emails' in locals() else 0}, "
         f"processed={processed}, published={published}, "
         f"skipped_duplicate={skipped_duplicate}, skipped_invalid={skipped_invalid}"
     )
