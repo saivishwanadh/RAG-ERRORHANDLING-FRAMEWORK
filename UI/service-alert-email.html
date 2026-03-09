@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Service Down Alert</title>
+</head>
+<body style="font-family: Arial, sans-serif; color: #333; margin: 0; padding: 0; background: #f9f9f9;">
+  <div style="max-width:680px; margin:30px auto;">
+
+    <!-- Header -->
+    <div style="background:#c0392b; color:white; padding:20px 28px; border-radius:8px 8px 0 0;">
+      <h2 style="margin:0; font-size:1.4em; letter-spacing:0.5px;">🔴 SERVICE DOWN ALERT</h2>
+      <p style="margin:6px 0 0 0; font-size:0.88em; opacity:0.88;">
+        RAG Error Handling Framework — Infrastructure Monitor
+      </p>
+    </div>
+
+    <!-- Body -->
+    <div style="border:2px solid #c0392b; border-top:none; padding:28px;
+                border-radius:0 0 8px 8px; background:#ffffff;">
+
+      <p style="font-size:1em; margin-top:0; line-height:1.6;">
+        A critical service has <strong style="color:#c0392b;">failed or become unreachable</strong>.
+        Immediate attention may be required.
+      </p>
+
+      <table style="width:100%; border-collapse:collapse; margin-top:16px;">
+        <tr>
+          <td style="background:#f5f5f5; font-weight:bold; padding:10px 12px;
+                     border:1px solid #ddd; width:32%; vertical-align:top;">Service</td>
+          <td style="padding:10px 12px; border:1px solid #ddd;
+                     color:#c0392b; font-weight:bold;">{{SERVICE_NAME}}</td>
+        </tr>
+        <tr>
+          <td style="background:#f5f5f5; font-weight:bold; padding:10px 12px;
+                     border:1px solid #ddd; vertical-align:top;">Environment</td>
+          <td style="padding:10px 12px; border:1px solid #ddd;">{{ENVIRONMENT}}</td>
+        </tr>
+        <tr>
+          <td style="background:#f5f5f5; font-weight:bold; padding:10px 12px;
+                     border:1px solid #ddd; vertical-align:top;">Timestamp (UTC)</td>
+          <td style="padding:10px 12px; border:1px solid #ddd;">{{TIMESTAMP}}</td>
+        </tr>
+        <tr>
+          <td style="background:#f5f5f5; font-weight:bold; padding:10px 12px;
+                     border:1px solid #ddd; vertical-align:top;">Context / Caller</td>
+          <td style="padding:10px 12px; border:1px solid #ddd;">{{CONTEXT}}</td>
+        </tr>
+        <tr>
+          <td style="background:#f5f5f5; font-weight:bold; padding:10px 12px;
+                     border:1px solid #ddd; vertical-align:top;">Error Details</td>
+          <td style="padding:10px 12px; border:1px solid #ddd;
+                     font-family:monospace; font-size:0.9em;
+                     background:#fff5f5; border-left:4px solid #c0392b;
+                     word-break:break-word;">{{ERROR_MESSAGE}}</td>
+        </tr>
+      </table>
+
+      <!-- Cooldown notice -->
+      <div style="margin-top:22px; padding:14px 16px; background:#fff3cd;
+                  border-left:4px solid #f39c12; border-radius:4px;">
+        <strong>⚠️ Alert Suppression Active:</strong> Further alerts for this service will be
+        suppressed for the next <strong>{{COOLDOWN_MINUTES}} minutes</strong> to prevent flooding.
+      </div>
+
+      <!-- Footer -->
+      <p style="margin-top:20px; color:#aaa; font-size:0.78em; border-top:1px solid #eee; padding-top:12px;">
+        Sent automatically by
+        <em>RAG Error Handling Framework — ServiceAlertNotifier</em>
+      </p>
+    </div>
+
+  </div>
+</body>
+</html>

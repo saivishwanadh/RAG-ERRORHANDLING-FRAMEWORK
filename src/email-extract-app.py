@@ -16,6 +16,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src.config import Config
 from src.structuraldb import DB
+from src.service_alert import ServiceAlertNotifier
 
 # Setup logging
 logging.basicConfig(
@@ -41,6 +42,9 @@ escalation_cooldown: Dict[tuple, datetime] = {}
 # Prevents duplicate emails arriving before consumer finishes from being re-published
 _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
 
+# Module-level service alert notifier (shared, cooldown-aware)
+_alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
+
 # Graph API Configuration
 # For Client Credentials, we usually use the /.default scope
 SCOPES = ["https://graph.microsoft.com/.default"]
@@ -55,6 +59,9 @@ def get_persistent_db() -> psycopg2.extensions.connection:
             logger.info("✅ Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
+        _alert_notifier.notify_service_down(
+            "PostgreSQL/DB", str(e), context="get_persistent_db"
+        )
         _db_conn = None
         raise
     return _db_conn
@@ -122,6 +129,9 @@ def setup_rabbitmq_connection():
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
+        _alert_notifier.notify_service_down(
+            "RabbitMQ", str(e), context="setup_rabbitmq_connection"
+        )
         rabbitmq_connection = None
         rabbitmq_channel = None  # Ensure stale channel isn't reused
 
@@ -468,6 +478,10 @@ def process_email_cycle():
     token = get_graph_token()
     if not token:
         logger.error("Could not obtain Graph Token. Skipping cycle.")
+        _alert_notifier.notify_service_down(
+            "Microsoft Graph API", "Failed to acquire access token (check Azure credentials)",
+            context="process_email_cycle:get_graph_token"
+        )
         return
 
     headers = {
@@ -504,7 +518,11 @@ def process_email_cycle():
     try:
         resp = requests.get(url, headers=headers, params=params)
         if resp.status_code != 200:
-            logger.error(f"Graph API Error: {resp.status_code} - {resp.text}")
+            err_msg = f"Graph API Error: {resp.status_code} - {resp.text[:300]}"
+            logger.error(err_msg)
+            _alert_notifier.notify_service_down(
+                "Microsoft Graph API", err_msg, context="process_email_cycle:fetch_emails"
+            )
             return
             
         emails = resp.json().get('value', [])
@@ -558,6 +576,15 @@ def process_email_cycle():
             logger.info("No valid emails after parsing.")
             return
 
+        # Pre-count occurrences of each (app, code, desc) key in this batch.
+        # Used to publish a single message with the accumulated batch count for
+        # brand-new errors, so the consumer inserts with the correct occurrence_count
+        # instead of always hardcoding 1.
+        batch_occurrence_counts: Dict[tuple, int] = {}
+        for _, p, _ in parsed_batch:
+            k = (p['applicationName'], p['code'], p['description'])
+            batch_occurrence_counts[k] = batch_occurrence_counts.get(k, 0) + 1
+
         # ONE batch DB query for all error keys — Optimization 3
         all_keys = [(p['applicationName'], p['code'], p['description']) for _, p, _ in parsed_batch]
         all_ts = [
@@ -572,6 +599,10 @@ def process_email_cycle():
 
         # Within-cycle tracker: catches duplicates before consumer inserts to DB
         within_cycle_counts: Dict[tuple, int] = {}
+        # Records the DB count at first-occurrence of each key this cycle.
+        # 0 = brand-new error (batch count was encoded in published payload).
+        # >0 = existing error (individual DB increments still needed).
+        within_cycle_first_db_count: Dict[tuple, int] = {}
 
         for email, payload, error_timestamp in parsed_batch:
             try:
@@ -581,11 +612,51 @@ def process_email_cycle():
                     within_cycle_counts[cycle_key] += 1
                     cycle_count = within_cycle_counts[cycle_key]
                     logger.info(f"⏭️ Same-cycle duplicate: {payload['code']} (#{cycle_count} this cycle)")
-                    # Still update DB occurrence_count so threshold tracking is accurate
-                    check_occurrence_count(
-                        payload['applicationName'], payload['code'],
-                        payload['description'], error_timestamp
-                    )
+
+                    first_db_count = within_cycle_first_db_count.get(cycle_key, -1)
+
+                    if first_db_count == 0:
+                        # Brand-new error: batch count was already encoded in the
+                        # single published message — no DB UPDATE needed here.
+                        # Consumer will insert with the correct occurrence_count.
+                        logger.debug(
+                            f"Batch-counted dup for new error {payload['code']} "
+                            f"— no individual DB update needed"
+                        )
+                    else:
+                        # Existing error: individual DB increment still required.
+                        new_db_count = check_occurrence_count(
+                            payload['applicationName'], payload['code'],
+                            payload['description'], error_timestamp
+                        )
+                        now_utc = datetime.now(timezone.utc)
+                        # Bug 2 fix carried forward: check escalation for existing errors
+                        if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                            error_key = (payload['applicationName'], payload['code'])
+                            last_alert = escalation_cooldown.get(error_key)
+                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                                logger.warning(
+                                    f"🚨 ESCALATION TRIGGERED (within-cycle): "
+                                    f"{payload['applicationName']}/{payload['code']} "
+                                    f"occurred {new_db_count}x "
+                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                                )
+                                send_high_priority_alert(
+                                    app_name=payload['applicationName'],
+                                    code=payload['code'],
+                                    description=payload['description'],
+                                    count=new_db_count,
+                                    timestamp=error_timestamp
+                                )
+                                escalation_cooldown[error_key] = now_utc
+                            else:
+                                minutes_since = (now_utc - last_alert).total_seconds() / 60
+                                logger.info(
+                                    f"⏸️ Escalation cooldown active for {payload['code']} "
+                                    f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
+                                )
+
                     skipped_duplicate += 1
                     continue
 
@@ -634,28 +705,50 @@ def process_email_cycle():
                                 f"(in-memory count={mem_count}, DB not yet updated by consumer)"
                             )
 
-                # Register in cycle tracker
+                # Register in cycle tracker + first-occurrence DB count
                 within_cycle_counts[cycle_key] = max(count, 1)
+                within_cycle_first_db_count[cycle_key] = count
 
                 # ── Act on final count ────────────────────────────────────────────────
                 if count == 0:
-                    # Brand new error — publish to RabbitMQ
-                    logger.info(f"✅ New error: {payload['applicationName']}/{payload['code']}")
+                    # Brand-new error — publish ONE message with the total batch
+                    # occurrence count so the consumer inserts the correct value.
+                    batch_count = batch_occurrence_counts.get(cycle_key, 1)
+                    publish_payload = {**payload, 'occurrence_count': batch_count}
+                    logger.info(f"✅ New error: {payload['applicationName']}/{payload['code']} (batch_count={batch_count})")
                     if rabbitmq_channel:
                         rabbitmq_channel.basic_publish(
                             exchange=Config.EXCHANGE,
                             routing_key=Config.ROUTING_KEY,
-                            body=json.dumps(payload),
+                            body=json.dumps(publish_payload),
                             properties=pika.BasicProperties(
                                 delivery_mode=2,
                                 content_type='application/json'
                             )
                         )
-                        # Register in cross-cycle cache immediately
-                        _published_cache[cycle_key] = (now_utc, 1)
+                        _published_cache[cycle_key] = (now_utc, batch_count)
                         published += 1
-                        logger.info(f"✅ Published: {payload['code']} | Cached for async gap protection")
+                        logger.info(f"✅ Published: {payload['code']} | batch_count={batch_count} | Cached for async gap")
                         processed += 1
+                        # Escalate immediately if batch itself crosses the threshold
+                        if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                            error_key = (payload['applicationName'], payload['code'])
+                            last_alert = escalation_cooldown.get(error_key)
+                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                                logger.warning(
+                                    f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
+                                    f"{payload['applicationName']}/{payload['code']} "
+                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                                )
+                                send_high_priority_alert(
+                                    app_name=payload['applicationName'],
+                                    code=payload['code'],
+                                    description=payload['description'],
+                                    count=batch_count,
+                                    timestamp=error_timestamp
+                                )
+                                escalation_cooldown[error_key] = now_utc
                     else:
                         logger.error(f"❌ RabbitMQ unavailable. Will retry next cycle.")
 

@@ -19,6 +19,7 @@ from src.structuraldb import DB
 from src.geminicall import GeminiClient
 from src.sendemail import EmailService
 from src.maskdata import LogSanitizer
+from src.service_alert import ServiceAlertNotifier
 from src.config import Config
 
 # ---- Logging ----
@@ -130,6 +131,9 @@ class ServiceContainer:
         self.cb_qdrant = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
         self.cb_email = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
 
+        # Service health alert notifier (shared, cooldown-aware)
+        self.alert = ServiceAlertNotifier()
+
     # ---- initialization ----
     def initialize(self):
         logger.info("Initializing services...")
@@ -141,6 +145,9 @@ class ServiceContainer:
             logger.info("Embedding generator initialized")
         except Exception as e:
             logger.exception("Failed to init Embedding generator")
+            self.alert.notify_service_down(
+                "Gemini/LLM", str(e), context="initialize:EmbeddingGenerator"
+            )
             raise
 
         # Qdrant
@@ -149,6 +156,9 @@ class ServiceContainer:
             logger.info("Qdrant initialized")
         except Exception as e:
             logger.exception("Failed to init Qdrant")
+            self.alert.notify_service_down(
+                "Qdrant/VectorDB", str(e), context="initialize:QdrantStore"
+            )
             raise
 
         # Gemini
@@ -157,6 +167,9 @@ class ServiceContainer:
             logger.info("Gemini initialized")
         except Exception as e:
             logger.exception("Failed to init Gemini")
+            self.alert.notify_service_down(
+                "Gemini/LLM", str(e), context="initialize:GeminiClient"
+            )
             raise
 
         # Sanitizer
@@ -174,6 +187,9 @@ class ServiceContainer:
             logger.info("DB reachable")
         except Exception as e:
             logger.exception("DB init failure")
+            self.alert.notify_service_down(
+                "PostgreSQL/DB", str(e), context="initialize:DB"
+            )
             raise
 
     def initialize_rabbitmq(self):
@@ -204,6 +220,9 @@ class ServiceContainer:
         except Exception as e:
             self.cb_db.record_failure()
             logger.exception("DB operation failed")
+            self.alert.notify_service_down(
+                "PostgreSQL/DB", str(e), context="db_execute"
+            )
             raise
 
     # qdrant search wrapper
@@ -218,6 +237,9 @@ class ServiceContainer:
         except Exception as e:
             self.cb_qdrant.record_failure()
             logger.exception("Qdrant search failed")
+            self.alert.notify_service_down(
+                "Qdrant/VectorDB", str(e), context="qdrant_search"
+            )
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3, allowed_status_for_retry=(429,))
@@ -228,12 +250,18 @@ class ServiceContainer:
             res = self.client.analyze_error(error_code, description, context=context)
             self.cb_llm.record_success()
             return res
-        except requests.exceptions.HTTPError:
+        except requests.exceptions.HTTPError as e:
             self.cb_llm.record_failure()
+            self.alert.notify_service_down(
+                "Gemini/LLM", str(e), context="call_llm:HTTPError"
+            )
             raise
         except Exception as e:
             self.cb_llm.record_failure()
             logger.exception("LLM call failed")
+            self.alert.notify_service_down(
+                "Gemini/LLM", str(e), context="call_llm"
+            )
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3)
@@ -274,6 +302,9 @@ class ServiceContainer:
         except Exception as e:
             self.cb_qdrant.record_failure()
             logger.exception("Qdrant upsert failed")
+            self.alert.notify_service_down(
+                "Qdrant/VectorDB", str(e), context="qdrant_upsert"
+            )
             raise
 # ---- helpers for formatting ----
 
@@ -360,7 +391,7 @@ def db_insert(llmresponse: dict):
         json.dumps(llmresponse),
         services.error_ts_str,
         'active',
-        1  # First occurrence always starts at 1
+        services.incoming_payload.get('occurrence_count', 1)  # Use batch-counted value from extractor
     )
 
     inserted_rows = services.db_execute(insert_sql, params, fetch=True)

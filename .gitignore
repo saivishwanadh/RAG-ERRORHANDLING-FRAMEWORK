@@ -18,3 +18,6 @@ __pycache__/
 *.log
 # OS
 .DS_Store
+
+# Service alert cooldown state (runtime file — not for version control)
+.service_alert_cooldowns.json

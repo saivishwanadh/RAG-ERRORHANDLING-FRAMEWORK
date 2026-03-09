@@ -15,6 +15,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src.config import Config
 from src.structuraldb import DB
+from src.service_alert import ServiceAlertNotifier
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -52,6 +53,9 @@ _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
 # Entries expire after DB_DUPLICATE_WINDOW_MINUTES (same TTL as other dedup layers).
 _seen_doc_ids: Dict[str, datetime] = {}
 
+# Module-level service alert notifier (shared across all poll cycles)
+_alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
+
 
 # ---------------------------------------------------------------------------
 # Persistent PostgreSQL connection helpers
@@ -66,6 +70,9 @@ def get_persistent_db() -> psycopg2.extensions.connection:
             logger.info("✅ Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
+        _alert_notifier.notify_service_down(
+            "PostgreSQL/DB", str(e), context="get_persistent_db"
+        )
         _db_conn = None
         raise
     return _db_conn
@@ -133,6 +140,9 @@ def setup_rabbitmq_connection():
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
+        _alert_notifier.notify_service_down(
+            "RabbitMQ", str(e), context="setup_rabbitmq_connection"
+        )
         rabbitmq_connection = None
         rabbitmq_channel = None
 
@@ -237,15 +247,29 @@ def fetch_opensearch_logs(since_dt: datetime) -> List[Dict[str, Any]]:
 
     except requests.exceptions.ConnectionError as e:
         logger.error(f"OpenSearch connection error — is the cluster running? {e}")
+        _alert_notifier.notify_service_down(
+            "OpenSearch", str(e), context="fetch_opensearch_logs:ConnectionError"
+        )
         return []
     except requests.exceptions.Timeout:
-        logger.error(f"OpenSearch query timed out after {Config.OPENSEARCH_TIMEOUT}s")
+        msg = f"OpenSearch query timed out after {Config.OPENSEARCH_TIMEOUT}s"
+        logger.error(msg)
+        _alert_notifier.notify_service_down(
+            "OpenSearch", msg, context="fetch_opensearch_logs:Timeout"
+        )
         return []
     except requests.exceptions.HTTPError as e:
-        logger.error(f"OpenSearch HTTP error: {e.response.status_code} — {e.response.text[:300]}")
+        err_text = f"OpenSearch HTTP error: {e.response.status_code} — {e.response.text[:300]}"
+        logger.error(err_text)
+        _alert_notifier.notify_service_down(
+            "OpenSearch", err_text, context="fetch_opensearch_logs:HTTPError"
+        )
         return []
     except Exception as e:
         logger.error(f"Unexpected error fetching OpenSearch logs: {e}")
+        _alert_notifier.notify_service_down(
+            "OpenSearch", str(e), context="fetch_opensearch_logs:unexpected"
+        )
         return []
 
 
@@ -537,7 +561,7 @@ def send_high_priority_alert(
         html_body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #333;">
         <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
-            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT (OpenSearch)</h2>
+            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
         </div>
         <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
             <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
@@ -556,7 +580,7 @@ def send_high_priority_alert(
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
                 <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
             </table>
-            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by RAG Error Handling Framework — Escalation Engine (OpenSearch)</p>
+            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by Opssolver Engine</p>
         </div>
         </body></html>
         """
@@ -678,6 +702,15 @@ def process_opensearch_cycle():
         logger.info(f"📊 Cycle completed in {duration:.2f}s: {len(hits)} hits, 0 new.")
         return
 
+    # Pre-count occurrences of each (app, code, desc) key in this batch.
+    # Used to publish a single message with the accumulated batch count for
+    # brand-new errors, so the consumer inserts with the correct occurrence_count
+    # instead of always hardcoding 1.
+    batch_occurrence_counts: Dict[tuple, int] = {}
+    for _, p, _ in parsed_batch:
+        k = (p["applicationName"], p["code"], p["description"])
+        batch_occurrence_counts[k] = batch_occurrence_counts.get(k, 0) + 1
+
     # Step 6: Batch-fetch DB occurrence counts in ONE query
     all_keys = [
         (p["applicationName"], p["code"], p["description"])
@@ -698,6 +731,10 @@ def process_opensearch_cycle():
 
     # Within-cycle tracker — catches same-batch duplicate log lines
     within_cycle_counts: Dict[tuple, int] = {}
+    # Records the DB count at first-occurrence of each key this cycle.
+    # 0 = brand-new error (batch count was encoded in published payload).
+    # >0 = existing error (individual DB increments still needed).
+    within_cycle_first_db_count: Dict[tuple, int] = {}
 
     for doc_id, payload, error_timestamp in parsed_batch:
         try:
@@ -709,13 +746,54 @@ def process_opensearch_cycle():
                 cycle_count = within_cycle_counts[cycle_key]
                 logger.info(
                     f"⏭️ Same-cycle duplicate: {payload['code']} "
-                    f"(#{cycle_count} this cycle) — updating occurrence_count only"
+                    f"(#{cycle_count} this cycle)"
                 )
-                # Still update DB so threshold tracking stays accurate
-                check_occurrence_count(
-                    payload["applicationName"], payload["code"],
-                    payload["description"], error_timestamp
-                )
+
+                first_db_count = within_cycle_first_db_count.get(cycle_key, -1)
+
+                if first_db_count == 0:
+                    # Brand-new error: batch count was already encoded in the
+                    # single published message — no DB UPDATE needed here.
+                    # Consumer will insert with the correct occurrence_count.
+                    logger.debug(
+                        f"Batch-counted dup for new error {payload['code']} "
+                        f"— no individual DB update needed"
+                    )
+                else:
+                    # Existing error: individual DB increment still required.
+                    new_db_count = check_occurrence_count(
+                        payload["applicationName"], payload["code"],
+                        payload["description"], error_timestamp
+                    )
+                    now_utc = datetime.now(timezone.utc)
+                    # Bug 2 fix carried forward: check escalation for existing errors
+                    if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                        error_key = (payload["applicationName"], payload["code"])
+                        last_alert = escalation_cooldown.get(error_key)
+                        cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                        if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                            logger.warning(
+                                f"🚨 ESCALATION TRIGGERED (within-cycle): "
+                                f"{payload['applicationName']}/{payload['code']} "
+                                f"occurred {new_db_count}x "
+                                f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                            )
+                            send_high_priority_alert(
+                                app_name=payload["applicationName"],
+                                code=payload["code"],
+                                description=payload["description"],
+                                count=new_db_count,
+                                timestamp=error_timestamp
+                            )
+                            escalation_cooldown[error_key] = now_utc
+                        else:
+                            minutes_since = (now_utc - last_alert).total_seconds() / 60
+                            logger.info(
+                                f"⏸️ Escalation cooldown active for {payload['code']} "
+                                f"({minutes_since:.1f}min ago, "
+                                f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
+                            )
+
                 skipped_duplicate += 1
                 continue
 
@@ -762,36 +840,57 @@ def process_opensearch_cycle():
                             f"(in-memory count={mem_count}, DB not yet updated)"
                         )
 
-            # Register in cycle tracker
+            # Register in cycle tracker + first-occurrence DB count
             within_cycle_counts[cycle_key] = max(count, 1)
+            within_cycle_first_db_count[cycle_key] = count
 
             # ── Act on final count ────────────────────────────────────────────
             if count == 0:
-                # Brand-new error — publish to RabbitMQ
+                # Brand-new error — publish ONE message with the total batch
+                # occurrence count so the consumer inserts the correct value.
+                batch_count = batch_occurrence_counts.get(cycle_key, 1)
+                publish_payload = {**payload, "occurrence_count": batch_count}
                 logger.info(
                     f"✅ New error: {payload['applicationName']}/{payload['code']} "
-                    f"(source=opensearch, doc_id={doc_id})"
+                    f"(source=opensearch, doc_id={doc_id}, batch_count={batch_count})"
                 )
                 if rabbitmq_channel:
                     rabbitmq_channel.basic_publish(
                         exchange=Config.EXCHANGE,
                         routing_key=Config.ROUTING_KEY,
-                        body=json.dumps(payload),
+                        body=json.dumps(publish_payload),
                         properties=pika.BasicProperties(
                             delivery_mode=2,
                             content_type="application/json"
                         )
                     )
-                    # Mark doc as seen and register in cross-cycle cache
                     mark_doc_seen(doc_id)
-                    _published_cache[cycle_key] = (now_utc, 1)
+                    _published_cache[cycle_key] = (now_utc, batch_count)
                     published += 1
-                    # Fix 3: Track processed count (mirrors email-extract-app processed counter)
                     processed += 1
                     logger.info(
-                        f"✅ Published: {payload['code']} | "
-                        f"doc_id cached for dedup, payload cached for async gap protection"
+                        f"✅ Published: {payload['code']} | batch_count={batch_count} | "
+                        f"doc_id cached for dedup, payload cached for async gap"
                     )
+                    # Escalate immediately if batch itself crosses the threshold
+                    if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                        error_key = (payload["applicationName"], payload["code"])
+                        last_alert = escalation_cooldown.get(error_key)
+                        cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                        if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                            logger.warning(
+                                f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
+                                f"{payload['applicationName']}/{payload['code']} "
+                                f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                            )
+                            send_high_priority_alert(
+                                app_name=payload["applicationName"],
+                                code=payload["code"],
+                                description=payload["description"],
+                                count=batch_count,
+                                timestamp=error_timestamp
+                            )
+                            escalation_cooldown[error_key] = now_utc
                 else:
                     logger.error("❌ RabbitMQ channel unavailable. Will retry next cycle.")
 

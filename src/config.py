@@ -95,6 +95,10 @@ class Config:
     ESCALATION_COOLDOWN_MINUTES = int(os.getenv("ESCALATION_COOLDOWN_MINUTES", "60"))  # min gap between repeat alerts
     HIGH_PRIORITY_TO_EMAIL = os.getenv("HIGH_PRIORITY_TO_EMAIL", "")
 
+    # Service Health Alerts (VectorDB / DB / Gemini / OpenSearch down)
+    ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "")                          # Recipient for service-down alerts
+    SERVICE_ALERT_COOLDOWN_MINUTES = int(os.getenv("SERVICE_ALERT_COOLDOWN_MINUTES", "30"))  # Min gap between repeat alerts per service
+
     
     @classmethod
     def validate(cls):
