@@ -16,6 +16,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src.config import Config
 from src.structuraldb import DB
+from src.service_alert import ServiceAlertNotifier
 
 # Setup logging
 logging.basicConfig(
@@ -41,6 +42,14 @@ escalation_cooldown: Dict[tuple, datetime] = {}
 # Prevents duplicate emails arriving before consumer finishes from being re-published
 _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
 
+# Layer 0: Rolling set of Graph API message IDs already published this window.
+# Keyed by message id, value is the UTC datetime when we first saw it.
+# Entries expire after DB_DUPLICATE_WINDOW_MINUTES (same TTL as other dedup layers).
+_seen_message_ids: Dict[str, datetime] = {}
+
+# Module-level service alert notifier (shared, cooldown-aware)
+_alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
+
 # Graph API Configuration
 # For Client Credentials, we usually use the /.default scope
 SCOPES = ["https://graph.microsoft.com/.default"]
@@ -55,6 +64,9 @@ def get_persistent_db() -> psycopg2.extensions.connection:
             logger.info("✅ Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
+        _alert_notifier.notify_service_down(
+            "PostgreSQL/DB", str(e), context="get_persistent_db"
+        )
         _db_conn = None
         raise
     return _db_conn
@@ -122,6 +134,9 @@ def setup_rabbitmq_connection():
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
+        _alert_notifier.notify_service_down(
+            "RabbitMQ", str(e), context="setup_rabbitmq_connection"
+        )
         rabbitmq_connection = None
         rabbitmq_channel = None  # Ensure stale channel isn't reused
 
@@ -192,7 +207,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
                         return next_td.get_text(strip=True)
             return ""
 
-     # --- Extract fields from HTML tables ---
+        # --- Extract fields from HTML tables ---
         project_name = get_cell_after_label("Project Name")
         if project_name:
             app_name = project_name
@@ -255,7 +270,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         "source": "email"
     }
 
-def check_occurrence_count(app_name, code, desc, timestamp) -> int:
+def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datetime) -> int:
     """
     Optimization 2: Single atomic UPDATE...RETURNING.
     - If record NOT found → UPDATE affects 0 rows → return 0 (new error)
@@ -361,31 +376,32 @@ def batch_fetch_occurrence_counts(
         return {}  # Fail open — all emails treated as new
 
 
-def deduplicate_emails(emails: List[Dict]) -> List[Dict]:
-    """Remove duplicate emails within the same batch"""
-    seen = set()
-    unique = []
-    
-    for email in emails:
-        try:
-            body = email.get('body', {}).get('content', '')
-            subject = email.get('subject', '')
-            payload = parse_tibco_email(body, subject)
-            
-            key = (payload['applicationName'], payload['code'], payload['description'])
-            if key not in seen:
-                seen.add(key)
-                unique.append(email)
-            else:
-                logger.debug(f"⏭️ Filtered duplicate in batch: {payload['code']}")
-        except Exception as e:
-            logger.warning(f"Failed to parse email for dedup: {e}")
-            unique.append(email)  # Include if parsing fails
-    
-    if len(emails) != len(unique):
-        logger.info(f"📊 Batch deduplication: {len(emails)} raw → {len(unique)} unique")
-    
-    return unique
+# ---------------------------------------------------------------------------
+# Seen-message-ID tracker (Layer 0 dedup — mirrors opensearch _seen_doc_ids)
+# ---------------------------------------------------------------------------
+
+def is_seen_message(message_id: str) -> bool:
+    """Return True if this Graph API message has already been published this window."""
+    return message_id in _seen_message_ids
+
+
+def mark_message_seen(message_id: str):
+    """Record that this message has been published."""
+    _seen_message_ids[message_id] = datetime.now(timezone.utc)
+
+
+def evict_expired_message_ids():
+    """
+    Remove stale entries from _seen_message_ids.
+    Call once per cycle to prevent unbounded memory growth.
+    TTL = DB_DUPLICATE_WINDOW_MINUTES (same as the DB dedup window).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=Config.DB_DUPLICATE_WINDOW_MINUTES)
+    expired = [k for k, v in _seen_message_ids.items() if v < cutoff]
+    for k in expired:
+        del _seen_message_ids[k]
+    if expired:
+        logger.debug(f"Evicted {len(expired)} expired message IDs from seen-ID cache")
 
 def send_high_priority_alert(app_name: str, code: str, description: str, count: int, timestamp: datetime):
     """Send a high-priority escalation email directly via SMTP, bypassing RabbitMQ."""
@@ -444,30 +460,24 @@ def send_high_priority_alert(app_name: str, code: str, description: str, count: 
     except Exception as e:
         logger.error(f"Failed to send high-priority alert: {e}")
 
-def mark_email_read(message_id: str, id_url: str, access_token: str):
-    """Mark email as read in Graph API"""
-    # Specifically for /users/{id}/messages/{id} endpoint
-    url = f"https://graph.microsoft.com/v1.0/users/{Config.AZURE_TARGET_EMAIL}/messages/{message_id}"
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    data = {'isRead': True}
-    resp = requests.patch(url, headers=headers, json=data)
-    if resp.status_code != 200:
-        logger.warning(f"Failed to mark email read: {resp.status_code} - {resp.text}")
-
 def process_email_cycle():
     """Main polling logic with metrics"""
     cycle_start = datetime.now()
-    logger.info("Starting Email Poll Cycle (Client Credentials)...")
+    logger.info("▶️  Starting Email Poll Cycle (Client Credentials)...")
 
-    # Optimization 5: Flush heartbeat frames to keep RabbitMQ connection alive
+    # Step 1: Keep RabbitMQ alive between cycles
     keep_rabbitmq_alive()
+
+    # Step 2: Evict stale message IDs from Layer-0 dedup cache
+    evict_expired_message_ids()
 
     token = get_graph_token()
     if not token:
         logger.error("Could not obtain Graph Token. Skipping cycle.")
+        _alert_notifier.notify_service_down(
+            "Microsoft Graph API", "Failed to acquire access token (check Azure credentials)",
+            context="process_email_cycle:get_graph_token"
+        )
         return
 
     headers = {
@@ -495,16 +505,22 @@ def process_email_cycle():
     }
     logger.info(f"Polling ALL emails (read+unread) since {since_str}")
     
-    # Metrics
+    # Cycle metrics — initialised here so all sub-loops can safely increment them
     processed = 0
     published = 0
     skipped_duplicate = 0
     skipped_invalid = 0
-    
+    emails: List[Dict] = []
+    filtered_emails: List[Dict] = []
+
     try:
         resp = requests.get(url, headers=headers, params=params)
         if resp.status_code != 200:
-            logger.error(f"Graph API Error: {resp.status_code} - {resp.text}")
+            err_msg = f"Graph API Error: {resp.status_code} - {resp.text[:300]}"
+            logger.error(err_msg)
+            _alert_notifier.notify_service_down(
+                "Microsoft Graph API", err_msg, context="process_email_cycle:fetch_emails"
+            )
             return
             
         emails = resp.json().get('value', [])
@@ -533,15 +549,23 @@ def process_email_cycle():
 
         setup_rabbitmq_connection()
 
-        # ── Optimization 3: Pre-parse all emails, then batch-fetch DB state in ONE query ──
+        # ── Pre-parse all emails, apply Layer-0 dedup, then batch-fetch DB state in ONE query ──
         parsed_batch: List[Tuple[Dict, Dict, datetime]] = []
         for email in filtered_emails:
+            message_id = email.get('id', '')
+
+            # Layer 0: message-ID dedup (prevents reprocessing same email across poll windows)
+            if is_seen_message(message_id):
+                logger.debug(f"⏭️ Already seen message_id={message_id}; skipping.")
+                skipped_duplicate += 1
+                continue
+
             body_content = email.get('body', {}).get('content', '')
             subject = email.get('subject', '')
             payload = parse_tibco_email(body_content, subject)
 
             if not all([payload.get('applicationName'), payload.get('code'), payload.get('description')]):
-                logger.warning(f"⚠️ Skipping email with missing fields: {email.get('id')}")
+                logger.warning(f"⚠️ Skipping email with missing fields: {message_id}")
                 skipped_invalid += 1
                 continue
 
@@ -558,6 +582,15 @@ def process_email_cycle():
             logger.info("No valid emails after parsing.")
             return
 
+        # Pre-count occurrences of each (app, code, desc) key in this batch.
+        # Used to publish a single message with the accumulated batch count for
+        # brand-new errors, so the consumer inserts with the correct occurrence_count
+        # instead of always hardcoding 1.
+        batch_occurrence_counts: Dict[tuple, int] = {}
+        for _, p, _ in parsed_batch:
+            k = (p['applicationName'], p['code'], p['description'])
+            batch_occurrence_counts[k] = batch_occurrence_counts.get(k, 0) + 1
+
         # ONE batch DB query for all error keys — Optimization 3
         all_keys = [(p['applicationName'], p['code'], p['description']) for _, p, _ in parsed_batch]
         all_ts = [
@@ -572,6 +605,10 @@ def process_email_cycle():
 
         # Within-cycle tracker: catches duplicates before consumer inserts to DB
         within_cycle_counts: Dict[tuple, int] = {}
+        # Records the DB count at first-occurrence of each key this cycle.
+        # 0 = brand-new error (batch count was encoded in published payload).
+        # >0 = existing error (individual DB increments still needed).
+        within_cycle_first_db_count: Dict[tuple, int] = {}
 
         for email, payload, error_timestamp in parsed_batch:
             try:
@@ -581,11 +618,51 @@ def process_email_cycle():
                     within_cycle_counts[cycle_key] += 1
                     cycle_count = within_cycle_counts[cycle_key]
                     logger.info(f"⏭️ Same-cycle duplicate: {payload['code']} (#{cycle_count} this cycle)")
-                    # Still update DB occurrence_count so threshold tracking is accurate
-                    check_occurrence_count(
-                        payload['applicationName'], payload['code'],
-                        payload['description'], error_timestamp
-                    )
+
+                    first_db_count = within_cycle_first_db_count.get(cycle_key, -1)
+
+                    if first_db_count == 0:
+                        # Brand-new error: batch count was already encoded in the
+                        # single published message — no DB UPDATE needed here.
+                        # Consumer will insert with the correct occurrence_count.
+                        logger.debug(
+                            f"Batch-counted dup for new error {payload['code']} "
+                            f"— no individual DB update needed"
+                        )
+                    else:
+                        # Existing error: individual DB increment still required.
+                        new_db_count = check_occurrence_count(
+                            payload['applicationName'], payload['code'],
+                            payload['description'], error_timestamp
+                        )
+                        now_utc = datetime.now(timezone.utc)
+                        # Bug 2 fix carried forward: check escalation for existing errors
+                        if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                            error_key = (payload['applicationName'], payload['code'])
+                            last_alert = escalation_cooldown.get(error_key)
+                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                                logger.warning(
+                                    f"🚨 ESCALATION TRIGGERED (within-cycle): "
+                                    f"{payload['applicationName']}/{payload['code']} "
+                                    f"occurred {new_db_count}x "
+                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                                )
+                                send_high_priority_alert(
+                                    app_name=payload['applicationName'],
+                                    code=payload['code'],
+                                    description=payload['description'],
+                                    count=new_db_count,
+                                    timestamp=error_timestamp
+                                )
+                                escalation_cooldown[error_key] = now_utc
+                            else:
+                                minutes_since = (now_utc - last_alert).total_seconds() / 60
+                                logger.info(
+                                    f"⏸️ Escalation cooldown active for {payload['code']} "
+                                    f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
+                                )
+
                     skipped_duplicate += 1
                     continue
 
@@ -634,28 +711,54 @@ def process_email_cycle():
                                 f"(in-memory count={mem_count}, DB not yet updated by consumer)"
                             )
 
-                # Register in cycle tracker
+                # Register in cycle tracker + first-occurrence DB count
                 within_cycle_counts[cycle_key] = max(count, 1)
+                within_cycle_first_db_count[cycle_key] = count
 
                 # ── Act on final count ────────────────────────────────────────────────
                 if count == 0:
-                    # Brand new error — publish to RabbitMQ
-                    logger.info(f"✅ New error: {payload['applicationName']}/{payload['code']}")
+                    # Brand-new error — publish ONE message with the total batch
+                    # occurrence count so the consumer inserts the correct value.
+                    batch_count = batch_occurrence_counts.get(cycle_key, 1)
+                    publish_payload = {**payload, 'occurrence_count': batch_count}
+                    logger.info(f"✅ New error: {payload['applicationName']}/{payload['code']} (batch_count={batch_count})")
                     if rabbitmq_channel:
                         rabbitmq_channel.basic_publish(
                             exchange=Config.EXCHANGE,
                             routing_key=Config.ROUTING_KEY,
-                            body=json.dumps(payload),
+                            body=json.dumps(publish_payload),
                             properties=pika.BasicProperties(
                                 delivery_mode=2,
                                 content_type='application/json'
                             )
                         )
-                        # Register in cross-cycle cache immediately
-                        _published_cache[cycle_key] = (now_utc, 1)
+                        mark_message_seen(email.get('id', ''))
+                        _published_cache[cycle_key] = (now_utc, batch_count)
                         published += 1
-                        logger.info(f"✅ Published: {payload['code']} | Cached for async gap protection")
+                        logger.info(
+                            f"✅ Published: {payload['code']} | batch_count={batch_count} | "
+                            f"message_id cached for dedup, payload cached for async gap"
+                        )
                         processed += 1
+                        # Escalate immediately if batch itself crosses the threshold
+                        if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
+                            error_key = (payload['applicationName'], payload['code'])
+                            last_alert = escalation_cooldown.get(error_key)
+                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
+                                logger.warning(
+                                    f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
+                                    f"{payload['applicationName']}/{payload['code']} "
+                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                                )
+                                send_high_priority_alert(
+                                    app_name=payload['applicationName'],
+                                    code=payload['code'],
+                                    description=payload['description'],
+                                    count=batch_count,
+                                    timestamp=error_timestamp
+                                )
+                                escalation_cooldown[error_key] = now_utc
                     else:
                         logger.error(f"❌ RabbitMQ unavailable. Will retry next cycle.")
 
@@ -701,44 +804,79 @@ def process_email_cycle():
     except Exception as e:
         logger.error(f"Poll cycle failed: {e}")
     
-    # Cycle metrics
+    # Step 9: Cycle metrics (aligned with opensearch-extract-app.py format)
     duration = (datetime.now() - cycle_start).total_seconds()
     logger.info(
         f"📊 Cycle completed in {duration:.2f}s: "
-        f"total={len(emails) if 'emails' in locals() else 0}, "
-        f"unique={len(unique_emails) if 'unique_emails' in locals() else 0}, "
+        f"total_emails={len(emails)}, filtered={len(filtered_emails)}, "
         f"processed={processed}, published={published}, "
         f"skipped_duplicate={skipped_duplicate}, skipped_invalid={skipped_invalid}"
     )
 
 def cleanup_and_exit():
+    logger.info("🛑 Shutting down Email extractor...")
     if scheduler and scheduler.running:
-        scheduler.shutdown()
-    if rabbitmq_connection:
-        rabbitmq_connection.close()
+        scheduler.shutdown(wait=False)
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        try:
+            rabbitmq_connection.close()
+        except Exception:
+            pass
     sys.exit(0)
 
+
 def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
     cleanup_and_exit()
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     # Validation
     if not Config.AZURE_CLIENT_ID or not Config.AZURE_CLIENT_SECRET:
         logger.error("Missing Azure Credentials in Config.")
         sys.exit(1)
-        
-    if "your-tenant-id" in Config.AZURE_TENANT_ID:
-         logger.warning("AZURE_TENANT_ID is set to default 'your-tenant-id'. Connection may fail.")
 
-    logger.info(f"🚀 Starting Email Extractor (Service Principal) for {Config.AZURE_TARGET_EMAIL}")
-    
+    if "your-tenant-id" in Config.AZURE_TENANT_ID:
+        logger.warning("AZURE_TENANT_ID is set to default 'your-tenant-id'. Connection may fail.")
+
+    logger.info(
+        f"🚀 Starting Email Extractor (Service Principal) | "
+        f"target={Config.AZURE_TARGET_EMAIL} | "
+        f"poll_interval={Config.EMAIL_POLL_INTERVAL}s | "
+        f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min | "
+        f"escalation_threshold={Config.HIGH_PRIORITY_THRESHOLD}"
+    )
+
+    # Initial connection setup at startup (fail-fast rather than silent)
+    try:
+        setup_rabbitmq_connection()
+        logger.info("✅ Initial RabbitMQ connection ready")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial RabbitMQ connection failed: {e}. Will retry per cycle.")
+
+    try:
+        get_persistent_db()
+        logger.info("✅ Initial DB connection ready")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial DB connection failed: {e}. Will retry per cycle.")
+
     scheduler = BlockingScheduler()
-    # Runs every X seconds
-    scheduler.add_job(process_email_cycle, 'interval', seconds=Config.EMAIL_POLL_INTERVAL)
-    
+    scheduler.add_job(
+        process_email_cycle,
+        'interval',
+        seconds=Config.EMAIL_POLL_INTERVAL,
+        max_instances=1,    # Prevent overlapping cycles if one runs long
+        coalesce=True       # Collapse missed executions into a single run
+    )
+
+    logger.info(
+        f"⏱️  Scheduler configured — running every {Config.EMAIL_POLL_INTERVAL}s. "
+        f"Press CTRL+C to stop."
+    )
+
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
