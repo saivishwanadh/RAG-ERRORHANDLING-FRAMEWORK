@@ -52,8 +52,8 @@ class GeminiClient:
         """
         Analyze error using LangChain invocation
         """
-        # Get ChatPromptTemplate from builder (pre-filled with platform context)
-        prompt_template = self.prompt_builder.get_prompt_template(platform="mulesoft")
+        # Get ChatPromptTemplate from builder (pre-filled with platform context from Config)
+        prompt_template = self.prompt_builder.get_prompt_template()
 
         # Create chain using LCEL (LangChain Expression Language) style or simple piping
         # chain = prompt | llm
