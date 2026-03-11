@@ -45,6 +45,12 @@ class Config:
     GEMINI_URL = os.getenv("GEMINI_URL")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL")
     
+    # Platform / Application Context for LLM Prompts
+    APP_PLATFORM_NAME = os.getenv("APP_PLATFORM_NAME", "Enterprise Application")
+    APP_PLATFORM_DOCS_URL = os.getenv("APP_PLATFORM_DOCS_URL", "https://docs.example.com")
+    APP_PLATFORM_TERMS = os.getenv("APP_PLATFORM_TERMS", "Components, Services, APIs")
+    APP_PLATFORM_TONE = os.getenv("APP_PLATFORM_TONE", "Technical expert, Actionable, Context-Aware, support engineer")
+    
     # Email / SMTP
     TO_EMAIL = os.getenv("TO_EMAIL")
     SMTP_HOST = os.getenv("SMTP_HOST")
