@@ -18,6 +18,12 @@ class Config:
     MAX_RETRY_COUNT = int(os.getenv("MAX_RETRY_COUNT", "3"))
     PREFETCH_COUNT = int(os.getenv("PREFETCH_COUNT", "1"))
     
+    # Platform / Application Context for LLM Prompts
+    APP_PLATFORM_NAME = os.getenv("APP_PLATFORM_NAME", "Enterprise Application")
+    APP_PLATFORM_DOCS_URL = os.getenv("APP_PLATFORM_DOCS_URL", "https://docs.example.com")
+    APP_PLATFORM_TERMS = os.getenv("APP_PLATFORM_TERMS", "Components, Services, APIs")
+    APP_PLATFORM_TONE = os.getenv("APP_PLATFORM_TONE", "Technical expert, Actionable, Context-Aware, support engineer")
+    
     # Database
     DB_URL = os.getenv("DB_URL")
     DB_DUPLICATE_WINDOW_MINUTES = int(os.getenv("DB_DUPLICATE_WINDOW_MINUTES", "10"))
