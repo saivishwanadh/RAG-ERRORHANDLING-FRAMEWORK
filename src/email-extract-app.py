@@ -178,9 +178,9 @@ def get_graph_token() -> Optional[str]:
         logger.error(f"Failed to acquire token: {result.get('error')}: {result.get('error_description')}")
         return None
 
-def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
+def parse_html_alert_email(body: str, subject: str) -> Dict[str, Any]:
     """
-    Parse TIBCO HTML alert email body.
+    Parse generic HTML alert email body.
     
     Extracts:
       - applicationName  <- 'Project Name' cell
@@ -189,7 +189,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
       - description      <- 'Message' + 'ERROR DUMP' sections combined
     """
     # Defaults
-    app_name = "TIBCO_APP"
+    app_name = "ALERT_APP"
     correlation_id = "UNKNOWN"
     error_code = "UNKNOWN_ERROR"
     description = subject or "No description"
@@ -562,7 +562,7 @@ def process_email_cycle():
 
             body_content = email.get('body', {}).get('content', '')
             subject = email.get('subject', '')
-            payload = parse_tibco_email(body_content, subject)
+            payload = parse_html_alert_email(body_content, subject)
 
             if not all([payload.get('applicationName'), payload.get('code'), payload.get('description')]):
                 logger.warning(f"⚠️ Skipping email with missing fields: {message_id}")
