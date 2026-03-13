@@ -163,7 +163,7 @@ class ServiceAlertNotifier:
             cooldowns[service_name] = datetime.utcnow().isoformat()
             _save_cooldowns(cooldowns)
             logger.warning(
-                f"[ServiceAlert] 🔴 Alert sent for '{service_name}' → {self.alert_to}"
+                f"[ServiceAlert] Alert sent for '{service_name}' → {self.alert_to}"
             )
         except Exception as exc:
             # Never let the notifier crash the caller
@@ -219,9 +219,9 @@ class ServiceAlertNotifier:
   <div style="max-width:680px; margin:20px auto;">
     <!-- Header -->
     <div style="background:#c0392b; color:white; padding:18px 24px; border-radius:6px 6px 0 0;">
-      <h2 style="margin:0; font-size:1.3em;">🔴 SERVICE DOWN ALERT</h2>
+      <h2 style="margin:0; font-size:1.3em;">SERVICE DOWN ALERT</h2>
       <p style="margin:6px 0 0 0; font-size:0.9em; opacity:0.9;">
-        RAG Error Handling Framework — Infrastructure Monitor
+        Opssolver Engine — Infrastructure Monitor
       </p>
     </div>
 
@@ -263,7 +263,7 @@ class ServiceAlertNotifier:
       </div>
 
       <p style="margin-top:18px; color:#999; font-size:0.8em;">
-        Sent by <em>RAG Error Handling Framework — ServiceAlertNotifier</em>
+        Sent by <em>Opssolver Engine — ServiceAlertNotifier</em>
       </p>
     </div>
   </div>
@@ -277,7 +277,7 @@ class ServiceAlertNotifier:
 
         msg = EmailMessage()
         msg["Subject"] = (
-            f"🔴 SERVICE DOWN: {service_name} — {Config.ENVIRONMENT or 'Unknown Env'}"
+            f"SERVICE DOWN: {service_name} — {Config.ENVIRONMENT or 'Unknown Env'}"
         )
         msg["From"] = self.smtp_user
         msg["To"] = self.alert_to
