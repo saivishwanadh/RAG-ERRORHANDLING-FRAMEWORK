@@ -406,7 +406,7 @@ def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datet
             return 0
 
         new_count = max(int(r['occurrence_count']) for r in rows)
-        logger.info(f"📈 {app_name}/{code}: occurrence_count → {new_count}")
+        logger.info(f"{app_name}/{code}: occurrence_count → {new_count}")
         return new_count
 
     except Exception as e:
@@ -489,7 +489,7 @@ def send_high_priority_alert(
         html_body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #333;">
         <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
-            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
+            <h2 style="margin:0;">HIGH-PRIORITY ERROR ALERT</h2>
         </div>
         <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
             <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
@@ -516,7 +516,7 @@ def send_high_priority_alert(
         """
 
         msg = EmailMessage()
-        msg["Subject"] = f"🚨 HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
+        msg["Subject"] = f"HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
         msg["From"] = Config.SMTP_USERNAME
         msg["To"] = to_email
         msg.set_content(f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. Check HTML version.")
@@ -529,7 +529,7 @@ def send_high_priority_alert(
             s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
             s.send_message(msg)
 
-        logger.warning(f"🚨 HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
+        logger.warning(f"HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
 
     except Exception as e:
         logger.error(f"Failed to send high-priority alert: {e}")
@@ -565,7 +565,7 @@ def process_cycle():
     if not hits:
         logger.info("No ELK hits in this cycle.")
         duration = (datetime.now() - cycle_start).total_seconds()
-        logger.info(f"📊 Cycle completed in {duration:.2f}s: no hits")
+        logger.info(f"Cycle completed in {duration:.2f}s: no hits")
         return
 
     # Step 5: Parse all hits, apply Layer-0 dedup
@@ -602,7 +602,7 @@ def process_cycle():
         logger.info("No valid ELK hits after parsing and Layer-0 dedup.")
         duration = (datetime.now() - cycle_start).total_seconds()
         logger.info(
-            f"📊 Cycle completed in {duration:.2f}s: total_hits={len(hits)}, "
+            f"Cycle completed in {duration:.2f}s: total_hits={len(hits)}, "
             f"parsed=0, skipped_invalid={skipped_invalid}, skipped_duplicate={skipped_duplicate}"
         )
         return
@@ -662,7 +662,7 @@ def process_cycle():
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                             logger.warning(
-                                f"🚨 ESCALATION TRIGGERED (within-cycle): "
+                                f"ESCALATION TRIGGERED (within-cycle): "
                                 f"{payload['applicationName']}/{payload['code']} "
                                 f"occurred {new_db_count}x "
                                 f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
@@ -678,7 +678,7 @@ def process_cycle():
                         else:
                             minutes_since = (now_utc - last_alert).total_seconds() / 60
                             logger.info(
-                                f"⏸️ Escalation cooldown active for {payload['code']} "
+                                f"Escalation cooldown active for {payload['code']} "
                                 f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                             )
 
@@ -708,7 +708,7 @@ def process_cycle():
                     if age > cache_ttl:
                         # Cache expired — treat as fresh new error
                         logger.info(
-                            f"🔄 Cache expired for {payload['code']} "
+                            f"Cache expired for {payload['code']} "
                             f"({age.total_seconds() / 60:.1f}min > "
                             f"{Config.DB_DUPLICATE_WINDOW_MINUTES}min TTL). "
                             f"Treating as new."
@@ -720,7 +720,7 @@ def process_cycle():
                         _published_cache[cycle_key] = (pub_time, mem_count)
                         count = mem_count
                         logger.info(
-                            f"⏳ Async gap duplicate: {payload['code']} "
+                            f"Async gap duplicate: {payload['code']} "
                             f"(in-memory count={mem_count}, DB not yet updated)"
                         )
 
@@ -762,7 +762,7 @@ def process_cycle():
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                             logger.warning(
-                                f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
+                                f"ESCALATION TRIGGERED (batch count={batch_count}): "
                                 f"{payload['applicationName']}/{payload['code']} "
                                 f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                             )
@@ -793,7 +793,7 @@ def process_cycle():
 
                 if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                     logger.warning(
-                        f"🚨 ESCALATION TRIGGERED: "
+                        f"ESCALATION TRIGGERED: "
                         f"{payload['applicationName']}/{payload['code']} "
                         f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                     )
@@ -808,7 +808,7 @@ def process_cycle():
                 else:
                     minutes_since = (now_utc - last_alert).total_seconds() / 60
                     logger.info(
-                        f"⏸️ Escalation cooldown active for {payload['code']} "
+                        f"Escalation cooldown active for {payload['code']} "
                         f"({minutes_since:.1f}min ago, "
                         f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                     )
@@ -821,7 +821,7 @@ def process_cycle():
     # Step 9: Cycle metrics
     duration = (datetime.now() - cycle_start).total_seconds()
     logger.info(
-        f"📊 Cycle completed in {duration:.2f}s: "
+        f"Cycle completed in {duration:.2f}s: "
         f"total_hits={len(hits)}, parsed={len(parsed_batch)}, "
         f"processed={processed}, published={published}, "
         f"skipped_duplicate={skipped_duplicate}, skipped_invalid={skipped_invalid}"
@@ -870,7 +870,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logger.info(
-        f"🚀 Starting ELK Extractor | "
+        f"Starting ELK Extractor | "
         f"poll_interval={Config.POLL_INTERVAL_SECONDS}s | "
         f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min | "
         f"escalation_threshold={Config.HIGH_PRIORITY_THRESHOLD}"
