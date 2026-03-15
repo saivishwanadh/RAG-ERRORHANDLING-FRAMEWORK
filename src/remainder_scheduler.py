@@ -43,7 +43,7 @@ class SchedulerService:
         """Initialize all services with error handling."""
         try:
             logger.info("=" * 70)
-            logger.info("🔧 Initializing Reminder Scheduler services...")
+            logger.info("Initializing Reminder Scheduler services...")
             logger.info("=" * 70)
             
             Config.validate()
@@ -66,7 +66,7 @@ class SchedulerService:
                 raise
             
             logger.info("✅ All services initialized successfully")
-            logger.info(f"📊 Configuration:")
+            logger.info(f"Configuration:")
             logger.info(f"   - Reminder interval: {Config.REMINDER_INTERVAL_HOURS} hours")
             logger.info(f"   - Max retries: {Config.MAX_RETRY_COUNT}")
             logger.info(f"   - Environment: {Config.ENVIRONMENT}")
@@ -190,7 +190,7 @@ def run_scheduler():
     """
     try:
         logger.info("=" * 70)
-        logger.info(f"🔄 Starting reminder check at {datetime.now()}")
+        logger.info(f"Starting reminder check at {datetime.now()}")
         logger.info("=" * 70)
         
         # Query for records needing reminders
@@ -244,7 +244,7 @@ def run_scheduler():
         
         # Summary
         logger.info("=" * 70)
-        logger.info(f"📊 Reminder run complete:")
+        logger.info(f"Reminder run complete:")
         logger.info(f"   ✅ Successful: {success_count}")
         logger.info(f"   ❌ Failed: {failure_count}")
         logger.info(f"   📧 Total processed: {len(rows)}")
@@ -272,7 +272,7 @@ def signal_handler(signum, frame):
 
 if __name__ == "__main__":
     logger.info("=" * 70)
-    logger.info("🚀 Starting Reminder Scheduler Service")
+    logger.info("Starting Reminder Scheduler Service")
     logger.info("=" * 70)
     
     # Register signal handlers

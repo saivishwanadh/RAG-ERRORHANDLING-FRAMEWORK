@@ -1,34 +1,10 @@
 from langchain_core.prompts import ChatPromptTemplate
+from src.config import Config
 
 class PromptBuilder:
     def __init__(self):
-        # Platform configurations
-        self.PLATFORM_CONFIGS = {
-            "mulesoft": {
-                "PLATFORM_NAME": "MuleSoft",
-                "PLATFORM_DOCS_URL": "https://docs.amulesoft.com/",
-                "PLATFORM_TERMS": "Anypoint Platform, DataWeave, Connectors, Runtimes",
-                "TONE": (
-                    "Technical expert, Actionable, Production-Safe, Concise, "
-                    "Context-Aware, Human Understandable, professional, "
-                    "mulesoft mentor/trainer/architect, trouble shooter, "
-                    "mulesoft support engineer, mulesoft strategic engineer"
-                )
-            },
-            "tibco": {
-                "PLATFORM_NAME": "TIBCO",
-                "PLATFORM_DOCS_URL": "https://docs.tibco.com/",
-                "PLATFORM_TERMS": "BusinessWorks, EMS, Hawk, ActiveMatrix, FTL, TIBCO Designer",
-                "TONE": (
-                    "Technical expert, Actionable, Production-Safe, Concise, "
-                    "Context-Aware, Human Understandable, professional, "
-                    "TIBCO mentor/trainer/architect, trouble shooter, "
-                    "TIBCO support engineer, TIBCO strategic engineer"
-                )
-            }
-        }
-
         # Base prompt template string
+
         self.SYSTEM_TEMPLATE = (
             "You are a certified {PLATFORM_NAME} integration expert with deep knowledge of its runtime, "
             "connectors, adapters, transformation language, platform services, and error-handling mechanisms.\n\n"
@@ -70,36 +46,27 @@ class PromptBuilder:
             "{TONE}"
         )
 
-    def get_prompt_template(self, platform) -> ChatPromptTemplate:
+    def get_prompt_template(self, platform: str = None) -> ChatPromptTemplate:
         """
-        Generate a LangChain ChatPromptTemplate with platform context pre-filled.
+        Generate a LangChain ChatPromptTemplate with generic application context pre-filled
+        from environment variables.
         The returned template expects 'ERROR_CODE', 'ERROR_DESCRIPTION', and 'CONTEXT'.
         
         Args:
-            platform (str): Platform name (mulesoft, etc.)
+            platform (str): Ignored. Kept for backward compatibility.
 
         Returns:
             ChatPromptTemplate: LangChain prompt template
         """
-
-        platform_key = platform.lower()
-
-        if platform_key not in self.PLATFORM_CONFIGS:
-            raise ValueError(
-                f"Platform '{platform}' not supported. Available: {list(self.PLATFORM_CONFIGS.keys())}"
-            )
-
-        config = self.PLATFORM_CONFIGS[platform_key]
-
-        # Use partial to pre-fill platform details
+        # Use partial to pre-fill platform details from Config
         prompt = ChatPromptTemplate.from_messages([
             ("system", self.SYSTEM_TEMPLATE),
             ("human", "Error Code: {ERROR_CODE}\nDescription: {ERROR_DESCRIPTION}")
         ])
         
         return prompt.partial(
-            PLATFORM_NAME=config["PLATFORM_NAME"],
-            PLATFORM_DOCS_URL=config["PLATFORM_DOCS_URL"],
-            PLATFORM_TERMS=config["PLATFORM_TERMS"],
-            TONE=config["TONE"]
+            PLATFORM_NAME=Config.APP_PLATFORM_NAME,
+            PLATFORM_DOCS_URL=Config.APP_PLATFORM_DOCS_URL,
+            PLATFORM_TERMS=Config.APP_PLATFORM_TERMS,
+            TONE=Config.APP_PLATFORM_TONE
         )

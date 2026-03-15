@@ -57,6 +57,12 @@ class Config:
     GEMINI_APIKEY = os.getenv("GEMINI_APIKEY")
     GEMINI_URL = os.getenv("GEMINI_URL")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+
+    # Platform / Application Context for LLM Prompts
+    APP_PLATFORM_NAME = os.getenv("APP_PLATFORM_NAME", "Enterprise Application")
+    APP_PLATFORM_DOCS_URL = os.getenv("APP_PLATFORM_DOCS_URL", "https://docs.example.com")
+    APP_PLATFORM_TERMS = os.getenv("APP_PLATFORM_TERMS", "Components, Services, APIs")
+    APP_PLATFORM_TONE = os.getenv("APP_PLATFORM_TONE", "Technical expert, Actionable, Context-Aware, support engineer")
     
     # Email / SMTP
     TO_EMAIL = os.getenv("TO_EMAIL")
@@ -98,6 +104,15 @@ class Config:
     # Service Health Alerts (VectorDB / DB / Gemini / OpenSearch down)
     ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "")                          # Recipient for service-down alerts
     SERVICE_ALERT_COOLDOWN_MINUTES = int(os.getenv("SERVICE_ALERT_COOLDOWN_MINUTES", "30"))  # Min gap between repeat alerts per service
+
+    # ITSM / Incident Management integration (loosely coupled)
+    # Set ITSM_PROVIDER to 'none' (or leave blank) to disable completely.
+    # Set to 'servicenow' to enable ServiceNow integration.
+    # Future: 'jira', 'pagerduty', etc.
+    ITSM_PROVIDER              = os.getenv("ITSM_PROVIDER", "none")
+    SERVICENOW_INSTANCE_URL    = os.getenv("SERVICENOW_INSTANCE_URL", "")
+    SERVICENOW_USERNAME        = os.getenv("SERVICENOW_USERNAME", "")
+    SERVICENOW_PASSWORD        = os.getenv("SERVICENOW_PASSWORD", "")
 
     
     @classmethod

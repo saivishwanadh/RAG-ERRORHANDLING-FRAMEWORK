@@ -1,29 +1,23 @@
 import os
 import json
 import logging
-import time
 import signal
 import sys
-import re
-import requests
-import pika
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.blocking import BlockingScheduler
+import pika
 
 from src.config import Config
-from src.structuraldb import DB
 from src.service_alert import ServiceAlertNotifier
 from src.incident_manager import IncidentManager
 
-# Module-level incident manager (disabled when ITSM_PROVIDER=none)
-_incident_manager = IncidentManager()
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# Setup logging
 logging.basicConfig(
     level=Config.LOG_LEVEL,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -34,28 +28,28 @@ logger = logging.getLogger(__name__)
 # Global state
 # ---------------------------------------------------------------------------
 
-# RabbitMQ persistent connection
 rabbitmq_connection: Optional[pika.BlockingConnection] = None
 rabbitmq_channel: Optional[pika.channel.Channel] = None
-
-# APScheduler instance
 scheduler: Optional[BlockingScheduler] = None
+http_session: Optional[requests.Session] = None
 
 # Persistent PostgreSQL connection — reused across all poll cycles
 _db_conn: Optional[psycopg2.extensions.connection] = None
+
+# ITSM Provider (ServiceNow)
+_incident_manager = IncidentManager()
 
 # In-memory escalation cooldown tracker: { (app_name, error_code) -> last_alert_datetime }
 escalation_cooldown: Dict[tuple, datetime] = {}
 
 # Cross-cycle async-gap cache: { (app_name, code, desc) -> (first_published_at UTC, count) }
 # Bridges the window between "published to RabbitMQ" and "consumer inserts DB record".
-# Prevents re-publishing the same error while the consumer is still processing it.
 _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
 
-# Rolling set of OpenSearch document IDs that have already been published this window.
+# Layer 0: Rolling set of ELK document IDs already published this window.
 # Keyed by doc _id, value is the UTC datetime when we first saw it.
-# Entries expire after DB_DUPLICATE_WINDOW_MINUTES (same TTL as other dedup layers).
-_seen_doc_ids: Dict[str, datetime] = {}
+# Entries expire after DB_DUPLICATE_WINDOW_MINUTES.
+_seen_elk_ids: Dict[str, datetime] = {}
 
 # Module-level service alert notifier (shared across all poll cycles)
 _alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
@@ -83,7 +77,7 @@ def get_persistent_db() -> psycopg2.extensions.connection:
 
 
 # ---------------------------------------------------------------------------
-# RabbitMQ connection helpers (identical pattern to email-extract-app)
+# RabbitMQ connection helpers
 # ---------------------------------------------------------------------------
 
 def setup_rabbitmq_connection():
@@ -119,13 +113,14 @@ def setup_rabbitmq_connection():
                 durable=True
             )
             rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
+            rabbitmq_channel.queue_bind(Config.QUEUE, Config.EXCHANGE, Config.ROUTING_KEY)
             logger.info("RabbitMQ channel restored")
             return
 
         # Full reconnect needed
         logger.info("Establishing new RabbitMQ connection...")
         params = pika.URLParameters(Config.RABBIT_URL)
-        params.heartbeat = 120                  # Heartbeat > poll interval
+        params.heartbeat = 120
         params.blocked_connection_timeout = 30
         params.socket_timeout = 10
         params.connection_attempts = 3
@@ -140,6 +135,7 @@ def setup_rabbitmq_connection():
             durable=True
         )
         rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
+        rabbitmq_channel.queue_bind(Config.QUEUE, Config.EXCHANGE, Config.ROUTING_KEY)
         logger.info("✅ RabbitMQ connection established (heartbeat=120s)")
 
     except Exception as e:
@@ -167,231 +163,165 @@ def keep_rabbitmq_alive():
 
 
 # ---------------------------------------------------------------------------
-# OpenSearch REST query helper
+# HTTP session (for ELK REST calls)
 # ---------------------------------------------------------------------------
 
-def build_opensearch_query(since_dt: datetime) -> Dict[str, Any]:
-    """
-    Build an OpenSearch bool query that fetches ERROR-level logs
-    received after `since_dt`.
+def setup_http_session() -> requests.Session:
+    """Create HTTP session with retry logic"""
+    global http_session
+    if http_session is None:
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=Config.HTTP_RETRIES,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=Config.HTTP_POOL_SIZE,
+            pool_maxsize=Config.HTTP_POOL_SIZE
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        http_session = session
+        logger.info("HTTP session created with retry logic")
+    return http_session
 
-    Args:
-        since_dt: UTC datetime lower bound for es_time filter.
 
-    Returns:
-        dict payload ready to POST to OpenSearch _search endpoint.
-    """
-    since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    query: Dict[str, Any] = {
+# ---------------------------------------------------------------------------
+# ELK query helpers
+# ---------------------------------------------------------------------------
+
+def build_elk_query(since_dt: datetime) -> Dict[str, Any]:
+    """Build ELK query for ERROR logs received after `since_dt`."""
+    since_epoch = int(since_dt.timestamp())
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    return {
         "query": {
             "bool": {
-                "filter": [
-                    # Only ERROR level logs
-                    {"term": {"loglevel": Config.OPENSEARCH_LOG_LEVEL_FILTER}},
-                    # Time window — only new logs since last poll
-                    {"range": {"es_time": {"gte": since_str}}}
+                "must": [
+                    {"match": {"level": "ERROR"}},
+                    {
+                        "range": {
+                            "instant.epochSecond": {
+                                "gte": since_epoch,
+                                "lte": now_epoch,
+                            }
+                        }
+                    },
                 ]
             }
         },
-        "size": Config.OPENSEARCH_BATCH_SIZE,
-        "sort": [{"es_time": {"order": "asc"}}]
+        "size": 1000,
+        "sort": [{"instant.epochSecond": "asc"}]
     }
-    return query
 
 
-def fetch_opensearch_logs(since_dt: datetime) -> List[Dict[str, Any]]:
+def fetch_elk_logs(since_dt: datetime) -> List[Dict[str, Any]]:
     """
-    Execute a REST POST to OpenSearch and return the list of hit documents.
-
-    Supports three auth modes (configured via env):
-      1. API Key  (OPENSEARCH_APIKEY is set)
-      2. Basic Auth (OPENSEARCH_USERNAME + OPENSEARCH_PASSWORD are set)
-      3. No auth (local unauthenticated cluster)
-
-    Args:
-        since_dt: Lower bound for es_time range filter.
-
-    Returns:
-        List of raw OpenSearch hit dicts (each has _id, _source, etc.)
+    Execute a REST POST to ELK and return the list of hit documents.
+    Returns list of raw ELK hit dicts (each has _id, _source, etc.)
     """
-    url = f"{Config.OPENSEARCH_URL}/{Config.OPENSEARCH_INDEX}/_search"
-    headers = {"Content-Type": "application/json"}
-    auth = None
-
-    # Auth selection
-    if Config.OPENSEARCH_APIKEY:
-        headers["Authorization"] = f"ApiKey {Config.OPENSEARCH_APIKEY}"
-        logger.debug("OpenSearch auth: API Key")
-    elif Config.OPENSEARCH_USERNAME and Config.OPENSEARCH_PASSWORD:
-        auth = (Config.OPENSEARCH_USERNAME, Config.OPENSEARCH_PASSWORD)
-        logger.debug("OpenSearch auth: Basic Auth")
-    else:
-        logger.debug("OpenSearch auth: None (open cluster)")
-
-    query_body = build_opensearch_query(since_dt)
+    session = setup_http_session()
+    headers = {
+        "Authorization": Config.ELK_APIKEY,
+        "Content-Type": "application/json"
+    }
+    query_body = build_elk_query(since_dt)
 
     try:
-        resp = requests.post(
-            url,
+        resp = session.post(
+            Config.ELK_SEARCH_URL,
             headers=headers,
             json=query_body,
-            auth=auth,
-            timeout=Config.OPENSEARCH_TIMEOUT,
-            verify=Config.OPENSEARCH_VERIFY_SSL
+            timeout=Config.ELK_TIMEOUT
         )
         resp.raise_for_status()
         data = resp.json()
         hits = data.get("hits", {}).get("hits", [])
         total = data.get("hits", {}).get("total", {}).get("value", 0)
         logger.info(
-            f"OpenSearch query returned {len(hits)}/{total} hits "
+            f"ELK query returned {len(hits)}/{total} hits "
             f"(timed_out={data.get('timed_out', False)})"
         )
         return hits
 
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"OpenSearch connection error — is the cluster running? {e}")
+        logger.error(f"ELK connection error — is the cluster running? {e}")
         _alert_notifier.notify_service_down(
-            "OpenSearch", str(e), context="fetch_opensearch_logs:ConnectionError"
+            "ELK/Elasticsearch", str(e), context="fetch_elk_logs:ConnectionError"
         )
         return []
     except requests.exceptions.Timeout:
-        msg = f"OpenSearch query timed out after {Config.OPENSEARCH_TIMEOUT}s"
+        msg = f"ELK query timed out after {Config.ELK_TIMEOUT}s"
         logger.error(msg)
         _alert_notifier.notify_service_down(
-            "OpenSearch", msg, context="fetch_opensearch_logs:Timeout"
+            "ELK/Elasticsearch", msg, context="fetch_elk_logs:Timeout"
         )
         return []
     except requests.exceptions.HTTPError as e:
-        err_text = f"OpenSearch HTTP error: {e.response.status_code} — {e.response.text[:300]}"
+        err_text = f"ELK HTTP error: {e.response.status_code} — {e.response.text[:300]}"
         logger.error(err_text)
         _alert_notifier.notify_service_down(
-            "OpenSearch", err_text, context="fetch_opensearch_logs:HTTPError"
+            "ELK/Elasticsearch", err_text, context="fetch_elk_logs:HTTPError"
         )
         return []
     except Exception as e:
-        logger.error(f"Unexpected error fetching OpenSearch logs: {e}")
+        logger.error(f"Unexpected error fetching ELK logs: {e}")
         _alert_notifier.notify_service_down(
-            "OpenSearch", str(e), context="fetch_opensearch_logs:unexpected"
+            "ELK/Elasticsearch", str(e), context="fetch_elk_logs:unexpected"
         )
         return []
 
 
-# ---------------------------------------------------------------------------
-# Log parsing
-# ---------------------------------------------------------------------------
-
-def extract_error_code_from_log(log_line: str) -> str:
+def parse_elk_hit(hit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Extract a meaningful error code from the raw log string.
+    Parse a single ELK hit document into the standard error payload format.
 
-    Strategy (in priority order):
-      1.  Custom regex from OPENSEARCH_ERROR_CODE_REGEX env var (if set).
-      2.  Pattern: "ERROR - <ClassName> " → use ClassName as the code.
-          e.g. "ERROR - DataEndpointConnectionWorker Error while..."
-               → "DataEndpointConnectionWorker"
-      3.  Pattern: [ClassName] bracket notation.
-      4.  Fallback → "UNKNOWN_ERROR"
-    """
-    if not log_line:
-        return "UNKNOWN_ERROR"
-
-    # Priority 1: user-supplied custom regex
-    custom_regex = Config.OPENSEARCH_ERROR_CODE_REGEX
-    if custom_regex:
-        m = re.search(custom_regex, log_line)
-        if m:
-            return m.group(1) if m.lastindex else m.group(0)
-
-    # Priority 2: "ERROR - <Word> " pattern (class/component name after the dash)
-    m = re.search(r'ERROR\s+-\s+([A-Za-z][A-Za-z0-9_$]+)', log_line)
-    if m:
-        return m.group(1)
-
-    # Priority 3: [ClassName] bracket notation
-    m = re.search(r'\[([A-Za-z][A-Za-z0-9_$.]+)\]', log_line)
-    if m:
-        return m.group(1)
-
-    return "UNKNOWN_ERROR"
-
-
-def parse_opensearch_log(hit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Parse a single OpenSearch hit document into the standard error payload
-    format consumed by the RAG pipeline.
-
-    Expected _source structure (from the sample):
+    Expected _source structure:
     {
-        "kubernetes": {
-            "container_name": "wso2am-gateway",
-            "pod_id": "8834675d-...",
-            "namespace_name": "wso2am4x-uat",
-            "pod_name": "wso2am-gateway-internal-deployment-...",
-            "host": "usadlskub020"
-        },
-        "log": "[2026-02-25 14:18:58,397] ERROR - DataEndpointConnectionWorker ...",
-        "loglevel": "ERROR",
-        "time": "2026-02-25T14:18:58.398882923Z",
-        "es_time": "2026-02-25T14:18:58.398Z",
-        "datacenter": "usdc-east",
-        "stream": "stdout"
+        "_id": "abc123",
+        "_source": {
+            "level": "ERROR",
+            "message": "{\"applicationName\":\"...\",\"correlationId\":\"...\",
+                         \"code\":\"...\",\"description\":\"...\"}",
+            "instant": {"epochSecond": 1234567890}
+        }
     }
 
-    Returns:
-        Standardised payload dict, or None if parsing fails or log is not an error.
+    Returns standardised payload dict, or None if parsing fails.
     """
     try:
         doc_id = hit.get("_id", "UNKNOWN")
         source = hit.get("_source", {})
 
-        # Guard: only process ERROR-level logs (belt-and-suspenders — query already filters)
-        if source.get("loglevel", "").upper() != "ERROR":
+        # Guard: only process ERROR-level logs
+        if source.get("level", "").upper() != "ERROR":
             return None
 
-        # --- Application name ---
-        # Prefer namespace_name as it's the logical grouping; fall back to container_name
-        k8s = source.get("kubernetes", {})
-        app_name = (
-            k8s.get("namespace_name")
-            or k8s.get("container_name")
-            or "UNKNOWN_APP"
+        msg = source.get("message", "")
+        # ELK message field may be JSON-encoded
+        try:
+            parsed_msg = json.loads(msg)
+        except (json.JSONDecodeError, TypeError):
+            parsed_msg = {"rawMessage": msg}
+
+        app_name = parsed_msg.get("applicationName") or "UNKNOWN_APP"
+        correlation_id = parsed_msg.get("correlationId") or doc_id
+        error_code = parsed_msg.get("code") or "UNKNOWN_ERROR"
+        description = (
+            parsed_msg.get("description")
+            or parsed_msg.get("rawMessage")
+            or "No description"
         )
 
-        # --- Correlation ID ---
-        # pod_id is a stable, meaningful correlation handle
-        correlation_id = k8s.get("pod_id") or k8s.get("pod_name") or doc_id
-
-        # --- Error code ---
-        log_line = source.get("log", "")
-        error_code = extract_error_code_from_log(log_line)
-
-        # --- Description — full log line ---
-        description = log_line.strip() or "No description"
-
-        # Optionally enrich description with k8s context
-        if Config.OPENSEARCH_ENRICH_DESCRIPTION:
-            extras = []
-            if k8s.get("host"):
-                extras.append(f"Host: {k8s['host']}")
-            if k8s.get("container_image"):
-                extras.append(f"Image: {k8s['container_image']}")
-            if k8s.get("datacenter") or source.get("datacenter"):
-                extras.append(f"Datacenter: {k8s.get('datacenter') or source.get('datacenter')}")
-            if extras:
-                description = description + " | " + " | ".join(extras)
-
-        # --- Timestamp ---
-        raw_ts = source.get("es_time") or source.get("time", "")
+        # Timestamp from epochSecond
+        epoch = source.get("instant", {}).get("epochSecond")
         try:
-            # Handle nanosecond precision: "2026-02-25T14:18:58.398882923Z"
-            # Trim to microseconds so fromisoformat can parse it
-            ts_clean = re.sub(r'(\.\d{6})\d+(Z)$', r'\1\2', raw_ts)
-            ts_clean = ts_clean.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(ts_clean)
-            timestamp = dt.timestamp()
-        except Exception:
-            logger.warning(f"Could not parse timestamp '{raw_ts}' for doc {doc_id}; using now()")
+            timestamp = float(epoch) if epoch is not None else datetime.now(timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            logger.warning(f"Could not parse timestamp '{epoch}' for doc {doc_id}; using now()")
             timestamp = datetime.now(timezone.utc).timestamp()
 
         return {
@@ -400,54 +330,53 @@ def parse_opensearch_log(hit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "code": error_code,
             "description": description,
             "timestamp": timestamp,
-            "source": "opensearch",
-            "_doc_id": doc_id          # Internal field — stripped before publishing
+            "source": "elk",
+            "_doc_id": doc_id   # Internal — stripped before publishing
         }
 
     except Exception as e:
-        logger.error(f"Failed to parse OpenSearch hit {hit.get('_id', '?')}: {e}")
+        logger.error(f"Failed to parse ELK hit {hit.get('_id', '?')}: {e}")
         return None
 
 
 # ---------------------------------------------------------------------------
-# Seen-ID tracker (replaces "mark email as read")
+# Seen-ID tracker (Layer 0 dedup)
 # ---------------------------------------------------------------------------
 
-def is_seen_doc(doc_id: str) -> bool:
+def is_seen_elk_doc(doc_id: str) -> bool:
     """Return True if this document has already been published this window."""
-    return doc_id in _seen_doc_ids
+    return doc_id in _seen_elk_ids
 
 
-def mark_doc_seen(doc_id: str):
+def mark_elk_doc_seen(doc_id: str):
     """Record that this document has been published."""
-    _seen_doc_ids[doc_id] = datetime.now(timezone.utc)
+    _seen_elk_ids[doc_id] = datetime.now(timezone.utc)
 
 
-def evict_expired_seen_ids():
+def evict_expired_elk_ids():
     """
-    Remove stale entries from _seen_doc_ids.
+    Remove stale entries from _seen_elk_ids.
     Call once per cycle to prevent unbounded memory growth.
-    TTL = DB_DUPLICATE_WINDOW_MINUTES (same as the DB dedup window).
+    TTL = DB_DUPLICATE_WINDOW_MINUTES.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=Config.DB_DUPLICATE_WINDOW_MINUTES)
-    expired = [k for k, v in _seen_doc_ids.items() if v < cutoff]
+    expired = [k for k, v in _seen_elk_ids.items() if v < cutoff]
     for k in expired:
-        del _seen_doc_ids[k]
+        del _seen_elk_ids[k]
     if expired:
-        logger.debug(f"Evicted {len(expired)} expired doc IDs from seen-ID cache")
+        logger.debug(f"Evicted {len(expired)} expired ELK doc IDs from seen-ID cache")
 
 
 # ---------------------------------------------------------------------------
-# Deduplication — DB layer (shared logic with email extractor)
+# Occurrence count helpers (Layer 1 — DB atomic UPDATE...RETURNING)
 # ---------------------------------------------------------------------------
 
 def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datetime) -> int:
     """
-    Atomic UPDATE...RETURNING to increment occurrence_count if a matching record
-    exists within DB_DUPLICATE_WINDOW_MINUTES.
-
-    Returns:
-        new occurrence_count if record found (>= 1), or 0 if brand-new error.
+    Single atomic UPDATE...RETURNING.
+    - DB record NOT found → returns 0 (new error)
+    - DB record FOUND → atomically increments occurrence_count and returns new value
+    Eliminates the separate SELECT round trip entirely.
     """
     global _db_conn
     try:
@@ -477,7 +406,7 @@ def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datet
         conn.commit()
 
         if not rows:
-            logger.debug(f"No existing DB record for {app_name}/{code} — new error")
+            logger.debug(f"No existing record for {app_name}/{code} — new error")
             return 0
 
         new_count = max(int(r['occurrence_count']) for r in rows)
@@ -491,8 +420,8 @@ def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datet
                 _db_conn.rollback()
         except Exception:
             pass
-        _db_conn = None   # Force reconnect next call
-        return 0          # Fail-open: treat as new error
+        _db_conn = None  # Force reconnect next call
+        return 0  # Fail open — treat as new error
 
 
 def batch_fetch_occurrence_counts(
@@ -500,18 +429,17 @@ def batch_fetch_occurrence_counts(
     local_timestamps: List[datetime]
 ) -> Dict[Tuple[str, str, str], int]:
     """
-    Pre-fetch occurrence counts for ALL logs in ONE query.
+    Pre-fetch occurrence counts for ALL errors in ONE query.
     Returns { (app_name, code, description) -> current occurrence_count }
-
-    Reduces N per-log DB queries to a single batch SELECT at cycle start.
+    Reduces N per-error DB queries to a single batch SELECT at cycle start.
     """
     if not error_keys:
         return {}
     global _db_conn
     try:
         conn = get_persistent_db()
-        min_ts = min(local_timestamps)
 
+        min_ts = min(local_timestamps)
         unique_pairs = list({(k[0], k[1]) for k in error_keys})
         placeholders = ','.join(['(%s,%s)'] * len(unique_pairs))
         pair_params: List = []
@@ -533,7 +461,7 @@ def batch_fetch_occurrence_counts(
         result: Dict[Tuple[str, str, str], int] = {}
         for row in rows:
             key = (row['application_name'], row['error_code'], row['error_description'])
-            if key not in result:   # Already ordered DESC, first hit is most recent
+            if key not in result:
                 result[key] = int(row['occurrence_count'] or 1)
 
         logger.debug(f"Batch pre-fetch: found {len(result)}/{len(error_keys)} errors in DB")
@@ -542,11 +470,11 @@ def batch_fetch_occurrence_counts(
     except Exception as e:
         logger.error(f"Batch fetch occurrence counts failed: {e}")
         _db_conn = None
-        return {}   # Fail-open: treat all as new
+        return {}  # Fail open — all errors treated as new
 
 
 # ---------------------------------------------------------------------------
-# High-priority escalation (identical to email-extract-app)
+# High-priority alert
 # ---------------------------------------------------------------------------
 
 def send_high_priority_alert(
@@ -575,6 +503,8 @@ def send_high_priority_alert(
                 <td style="padding:8px;border:1px solid #ddd;">{app_name}</td></tr>
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Error Code</td>
                 <td style="padding:8px;border:1px solid #ddd;">{code}</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Source</td>
+                <td style="padding:8px;border:1px solid #ddd;">ELK/Elasticsearch</td></tr>
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Occurrences</td>
                 <td style="padding:8px;border:1px solid #ddd;color:#b0002a;font-weight:bold;">{count} times</td></tr>
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Time Window</td>
@@ -584,22 +514,16 @@ def send_high_priority_alert(
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
                 <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
             </table>
-            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by Opssolver Engine</p>
+            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by RAG Error Handling Framework — Escalation Engine</p>
         </div>
         </body></html>
         """
 
         msg = EmailMessage()
-        msg["Subject"] = (
-            f"HIGH PRIORITY: {code} occurred {count}x "
-            f"in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}] (OpenSearch)"
-        )
+        msg["Subject"] = f"HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
         msg["From"] = Config.SMTP_USERNAME
         msg["To"] = to_email
-        msg.set_content(
-            f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. "
-            f"Check HTML version."
-        )
+        msg.set_content(f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. Check HTML version.")
         msg.add_alternative(html_body, subtype="html")
 
         with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT) as s:
@@ -609,117 +533,93 @@ def send_high_priority_alert(
             s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
             s.send_message(msg)
 
-        logger.warning(
-            f"HIGH-PRIORITY ALERT SENT (OpenSearch): "
-            f"{app_name}/{code} ({count}x) → {to_email}"
-        )
+        logger.warning(f"HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
 
     except Exception as e:
         logger.error(f"Failed to send high-priority alert: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Main poll cycle
+# Main processing cycle
 # ---------------------------------------------------------------------------
 
-def process_opensearch_cycle():
-    """
-    Main polling loop executed every POLL_INTERVAL_SECONDS by APScheduler.
-
-    Steps:
-      1. Flush RabbitMQ heartbeat frames.
-      2. Calculate the time window lower bound (now - POLL_INTERVAL_SECONDS).
-      3. Evict stale entries from the seen-doc-ID cache.
-      4. Fetch ERROR-level hits from OpenSearch.
-      5. Parse each hit into the standard error payload.
-      6. Batch-fetch occurrence counts from PostgreSQL in one query.
-      7. Per-doc 4-layer deduplication:
-           Layer 0 — doc-ID cache
-           Layer 1 — DB atomic UPDATE...RETURNING
-           Layer 2 — in-memory _published_cache (async-gap bridge)
-           Layer 3 — within-cycle counter
-      8. Publish new errors to RabbitMQ; escalate high-occurrence errors.
-      9. Log cycle metrics.
-    """
+def process_cycle():
+    """Main ELK polling cycle with 4-layer deduplication and occurrence tracking."""
     cycle_start = datetime.now()
-    logger.info("▶️  Starting OpenSearch Poll Cycle...")
+    logger.info("▶️  Starting ELK Poll Cycle...")
 
     # Step 1: Keep RabbitMQ alive between cycles
     keep_rabbitmq_alive()
 
-    # Step 2: Build time window lower bound
+    # Step 2: Evict stale doc IDs from Layer-0 dedup cache
+    evict_expired_elk_ids()
+
+    # Step 3: Reconnect if needed
+    setup_rabbitmq_connection()
+
+    # Step 4: Fetch logs from ELK
     since_dt = datetime.now(timezone.utc) - timedelta(seconds=Config.POLL_INTERVAL_SECONDS)
+    hits = fetch_elk_logs(since_dt)
 
-    # Step 3: Evict expired doc IDs from seen cache
-    evict_expired_seen_ids()
-
-    # Step 4: Fetch hits from OpenSearch
-    hits = fetch_opensearch_logs(since_dt)
-    if not hits:
-        logger.info("No ERROR-level logs returned from OpenSearch this cycle.")
-        duration = (datetime.now() - cycle_start).total_seconds()
-        logger.info(f"Cycle completed in {duration:.2f}s: 0 hits.")
-        return
-
-    # Cycle metrics — initialised here so all sub-loops can safely increment them
     processed = 0
     published = 0
     skipped_duplicate = 0
     skipped_invalid = 0
 
-    # Step 5: Parse all hits into standard payloads (skip Layer-0 doc-ID dupes here)
-    parsed_batch: List[Tuple[str, Dict[str, Any], datetime]] = []
+    if not hits:
+        logger.info("No ELK hits in this cycle.")
+        duration = (datetime.now() - cycle_start).total_seconds()
+        logger.info(f"Cycle completed in {duration:.2f}s: no hits")
+        return
+
+    # Step 5: Parse all hits, apply Layer-0 dedup
+    parsed_batch: List[Tuple[Dict, Dict, datetime]] = []
     for hit in hits:
         doc_id = hit.get("_id", "UNKNOWN")
 
-        # Layer 0: doc-ID dedup
-        if is_seen_doc(doc_id):
+        # Layer 0: doc-ID dedup (prevents reprocessing same ELK doc across poll windows)
+        if is_seen_elk_doc(doc_id):
             logger.debug(f"⏭️ Already seen doc_id={doc_id}; skipping.")
+            skipped_duplicate += 1
             continue
 
-        payload = parse_opensearch_log(hit)
+        payload = parse_elk_hit(hit)
         if payload is None:
+            skipped_invalid += 1
             continue
 
-        # Strip internal _doc_id before publishing
-        payload.pop("_doc_id", None)
-
-        # Fix 1: Guard — skip docs with missing required fields (mirrors email-extract-app)
-        if not all([payload.get("applicationName"), payload.get("code"), payload.get("description")]):
-            logger.warning(f"⚠️ Skipping doc {doc_id} with missing required fields")
+        if not all([payload.get('applicationName'), payload.get('code'), payload.get('description')]):
+            logger.warning(f"⚠️ Skipping ELK hit with missing fields: doc_id={doc_id}")
             skipped_invalid += 1
             continue
 
         try:
-            error_timestamp = datetime.fromtimestamp(payload["timestamp"], tz=timezone.utc)
+            error_timestamp = datetime.fromtimestamp(payload['timestamp'], tz=timezone.utc)
         except (ValueError, OSError, TypeError) as e:
-            logger.error(f"❌ Invalid timestamp for doc {doc_id}: {e}")
-            # Fix 2: Increment skipped_invalid on timestamp failure (mirrors email-extract-app)
+            logger.error(f"❌ Invalid timestamp {payload['timestamp']} for doc {doc_id}: {e}")
             skipped_invalid += 1
             continue
 
-        parsed_batch.append((doc_id, payload, error_timestamp))
+        parsed_batch.append((hit, payload, error_timestamp))
 
     if not parsed_batch:
-        logger.info("No new (unseen) valid ERROR docs after Layer-0 filter.")
+        logger.info("No valid ELK hits after parsing and Layer-0 dedup.")
         duration = (datetime.now() - cycle_start).total_seconds()
-        logger.info(f"Cycle completed in {duration:.2f}s: {len(hits)} hits, 0 new.")
+        logger.info(
+            f"Cycle completed in {duration:.2f}s: total_hits={len(hits)}, "
+            f"parsed=0, skipped_invalid={skipped_invalid}, skipped_duplicate={skipped_duplicate}"
+        )
         return
 
-    # Pre-count occurrences of each (app, code, desc) key in this batch.
-    # Used to publish a single message with the accumulated batch count for
-    # brand-new errors, so the consumer inserts with the correct occurrence_count
-    # instead of always hardcoding 1.
+    # Step 6: Pre-count occurrences within this batch
+    # For brand-new errors: publish ONE message with the total batch count
     batch_occurrence_counts: Dict[tuple, int] = {}
     for _, p, _ in parsed_batch:
-        k = (p["applicationName"], p["code"], p["description"])
+        k = (p['applicationName'], p['code'], p['description'])
         batch_occurrence_counts[k] = batch_occurrence_counts.get(k, 0) + 1
 
-    # Step 6: Batch-fetch DB occurrence counts in ONE query
-    all_keys = [
-        (p["applicationName"], p["code"], p["description"])
-        for _, p, _ in parsed_batch
-    ]
+    # Step 7: ONE batch DB query for all error keys (Optimization: N queries → 1)
+    all_keys = [(p['applicationName'], p['code'], p['description']) for _, p, _ in parsed_batch]
     all_ts = [
         ts.astimezone().replace(tzinfo=None) if ts.tzinfo else ts
         for _, _, ts in parsed_batch
@@ -730,49 +630,38 @@ def process_opensearch_cycle():
         f"{len(set(all_keys)) - len(prefetched_counts)} new"
     )
 
-    # Step 7 & 8: Per-doc processing
-    setup_rabbitmq_connection()
-
-    # Within-cycle tracker — catches same-batch duplicate log lines
+    # Step 8: Within-cycle tracker
     within_cycle_counts: Dict[tuple, int] = {}
-    # Records the DB count at first-occurrence of each key this cycle.
-    # 0 = brand-new error (batch count was encoded in published payload).
-    # >0 = existing error (individual DB increments still needed).
     within_cycle_first_db_count: Dict[tuple, int] = {}
 
-    for doc_id, payload, error_timestamp in parsed_batch:
+    for hit, payload, error_timestamp in parsed_batch:
+        doc_id = payload.pop("_doc_id", hit.get("_id", "UNKNOWN"))
         try:
-            cycle_key = (payload["applicationName"], payload["code"], payload["description"])
+            cycle_key = (payload['applicationName'], payload['code'], payload['description'])
 
-            # Layer 3: Within-cycle deduplication
+            # ── Layer 3: Within-cycle deduplication ─────────────────────────────
             if cycle_key in within_cycle_counts:
                 within_cycle_counts[cycle_key] += 1
                 cycle_count = within_cycle_counts[cycle_key]
-                logger.info(
-                    f"⏭️ Same-cycle duplicate: {payload['code']} "
-                    f"(#{cycle_count} this cycle)"
-                )
+                logger.info(f"⏭️ Same-cycle duplicate: {payload['code']} (#{cycle_count} this cycle)")
 
                 first_db_count = within_cycle_first_db_count.get(cycle_key, -1)
 
                 if first_db_count == 0:
-                    # Brand-new error: batch count was already encoded in the
-                    # single published message — no DB UPDATE needed here.
-                    # Consumer will insert with the correct occurrence_count.
+                    # Brand-new: batch count already encoded in the single published message
                     logger.debug(
                         f"Batch-counted dup for new error {payload['code']} "
                         f"— no individual DB update needed"
                     )
                 else:
-                    # Existing error: individual DB increment still required.
+                    # Existing error: individual DB increment still required
                     new_db_count = check_occurrence_count(
-                        payload["applicationName"], payload["code"],
-                        payload["description"], error_timestamp
+                        payload['applicationName'], payload['code'],
+                        payload['description'], error_timestamp
                     )
                     now_utc = datetime.now(timezone.utc)
-                    # Bug 2 fix carried forward: check escalation for existing errors
                     if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                        error_key = (payload["applicationName"], payload["code"])
+                        error_key = (payload['applicationName'], payload['code'])
                         last_alert = escalation_cooldown.get(error_key)
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
@@ -783,9 +672,9 @@ def process_opensearch_cycle():
                                 f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                             )
                             send_high_priority_alert(
-                                app_name=payload["applicationName"],
-                                code=payload["code"],
-                                description=payload["description"],
+                                app_name=payload['applicationName'],
+                                code=payload['code'],
+                                description=payload['description'],
                                 count=new_db_count,
                                 timestamp=error_timestamp
                             )
@@ -794,31 +683,27 @@ def process_opensearch_cycle():
                             minutes_since = (now_utc - last_alert).total_seconds() / 60
                             logger.info(
                                 f"Escalation cooldown active for {payload['code']} "
-                                f"({minutes_since:.1f}min ago, "
-                                f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
+                                f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                             )
 
                 skipped_duplicate += 1
                 continue
 
-            # Layer 1: DB atomic UPDATE...RETURNING
+            # ── Layer 1: DB atomic UPDATE...RETURNING ───────────────────────────
             count = check_occurrence_count(
-                payload["applicationName"], payload["code"],
-                payload["description"], error_timestamp
+                payload['applicationName'], payload['code'],
+                payload['description'], error_timestamp
             )
 
             now_utc = datetime.now(timezone.utc)
             cache_ttl = timedelta(minutes=Config.DB_DUPLICATE_WINDOW_MINUTES)
 
             if count > 0:
-                # DB already has the record — consumer has processed it
-                # Clean up in-memory cache (no longer needed as async bridge)
+                # DB already has the record — clean up async-gap cache
                 _published_cache.pop(cycle_key, None)
 
             elif count == 0:
-                # DB has no record yet — could be brand-new OR an async gap
-
-                # Layer 2: In-memory published-cache check
+                # ── Layer 2: In-memory published-cache check ─────────────────────
                 cache_entry = _published_cache.get(cycle_key)
                 if cache_entry:
                     pub_time, mem_count = cache_entry
@@ -833,7 +718,6 @@ def process_opensearch_cycle():
                             f"Treating as new."
                         )
                         _published_cache.pop(cycle_key, None)
-                        # count stays 0 → will publish below
                     else:
                         # Async gap duplicate — consumer hasn't inserted yet
                         mem_count += 1
@@ -844,19 +728,18 @@ def process_opensearch_cycle():
                             f"(in-memory count={mem_count}, DB not yet updated)"
                         )
 
-            # Register in cycle tracker + first-occurrence DB count
+            # Register in cycle tracker
             within_cycle_counts[cycle_key] = max(count, 1)
             within_cycle_first_db_count[cycle_key] = count
 
-            # ── Act on final count ────────────────────────────────────────────
+            # ── Act on final count ───────────────────────────────────────────────
             if count == 0:
-                # Brand-new error — publish ONE message with the total batch
-                # occurrence count so the consumer inserts the correct value.
+                # Brand-new error — publish ONE message with total batch count
                 batch_count = batch_occurrence_counts.get(cycle_key, 1)
                 publish_payload = {**payload, "occurrence_count": batch_count}
                 logger.info(
                     f"✅ New error: {payload['applicationName']}/{payload['code']} "
-                    f"(source=opensearch, doc_id={doc_id}, batch_count={batch_count})"
+                    f"(source=elk, doc_id={doc_id}, batch_count={batch_count})"
                 )
                 if rabbitmq_channel:
                     rabbitmq_channel.basic_publish(
@@ -868,7 +751,7 @@ def process_opensearch_cycle():
                             content_type="application/json"
                         )
                     )
-                    mark_doc_seen(doc_id)
+                    mark_elk_doc_seen(doc_id)
                     _published_cache[cycle_key] = (now_utc, batch_count)
                     published += 1
                     processed += 1
@@ -878,9 +761,20 @@ def process_opensearch_cycle():
                     )
                     # Escalate immediately if batch itself crosses the threshold
                     if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                        error_key = (payload["applicationName"], payload["code"])
+                        error_key = (payload['applicationName'], payload['code'])
                         last_alert = escalation_cooldown.get(error_key)
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                        
+                        # ITSM: open/escalate ServiceNow incident for high-priority burst
+                        _itsm_key = f"{payload['applicationName']}_{payload['code']}"
+                        _incident_manager.handle_high_priority(
+                            error_key=_itsm_key,
+                            app_name=payload['applicationName'],
+                            error_code=payload['code'],
+                            description=payload['description'],
+                            count=batch_count,
+                        )
+
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                             logger.warning(
                                 f"ESCALATION TRIGGERED (batch count={batch_count}): "
@@ -888,46 +782,38 @@ def process_opensearch_cycle():
                                 f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                             )
                             send_high_priority_alert(
-                                app_name=payload["applicationName"],
-                                code=payload["code"],
-                                description=payload["description"],
+                                app_name=payload['applicationName'],
+                                code=payload['code'],
+                                description=payload['description'],
                                 count=batch_count,
                                 timestamp=error_timestamp
-                            )
-                            # ITSM: open/escalate ServiceNow incident for high-priority burst
-                            _itsm_key = f"{payload['applicationName']}_{payload['code']}"
-                            _incident_manager.handle_high_priority(
-                                error_key=_itsm_key,
-                                app_name=payload["applicationName"],
-                                error_code=payload["code"],
-                                description=payload["description"],
-                                count=batch_count,
                             )
                             escalation_cooldown[error_key] = now_utc
                 else:
                     logger.error("❌ RabbitMQ channel unavailable. Will retry next cycle.")
 
             elif count < Config.HIGH_PRIORITY_THRESHOLD:
-                # Known duplicate — below threshold, skip email/queue publish
+                # Known duplicate — skip silently
                 logger.info(
-                    f"Duplicate: {payload['applicationName']}/{payload['code']} "
+                    f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
                     f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                 )
+                
                 # ITSM: update the existing ticket with recurrence note
-                # (no email, no queue publish — just keep the ITSM ticket fresh)
                 _itsm_key = f"{payload['applicationName']}_{payload['code']}"
                 _incident_manager.handle_error(
                     error_key=_itsm_key,
-                    app_name=payload["applicationName"],
-                    error_code=payload["code"],
-                    description=payload["description"],
+                    app_name=payload['applicationName'],
+                    error_code=payload['code'],
+                    description=payload['description'],
                     count=count,
                 )
+                
                 skipped_duplicate += 1
 
             else:
                 # count >= HIGH_PRIORITY_THRESHOLD — escalate!
-                error_key = (payload["applicationName"], payload["code"])
+                error_key = (payload['applicationName'], payload['code'])
                 last_alert = escalation_cooldown.get(error_key)
                 cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
 
@@ -935,9 +821,9 @@ def process_opensearch_cycle():
                 _itsm_key = f"{payload['applicationName']}_{payload['code']}"
                 _incident_manager.handle_high_priority(
                     error_key=_itsm_key,
-                    app_name=payload["applicationName"],
-                    error_code=payload["code"],
-                    description=payload["description"],
+                    app_name=payload['applicationName'],
+                    error_code=payload['code'],
+                    description=payload['description'],
                     count=count,
                 )
 
@@ -948,9 +834,9 @@ def process_opensearch_cycle():
                         f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                     )
                     send_high_priority_alert(
-                        app_name=payload["applicationName"],
-                        code=payload["code"],
-                        description=payload["description"],
+                        app_name=payload['applicationName'],
+                        code=payload['code'],
+                        description=payload['description'],
                         count=count,
                         timestamp=error_timestamp
                     )
@@ -958,7 +844,7 @@ def process_opensearch_cycle():
                 else:
                     minutes_since = (now_utc - last_alert).total_seconds() / 60
                     logger.info(
-                        f"Escalation email cooldown active for {payload['code']} "
+                        f"Escalation cooldown active for {payload['code']} "
                         f"({minutes_since:.1f}min ago, "
                         f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                     )
@@ -968,7 +854,7 @@ def process_opensearch_cycle():
         except Exception as e:
             logger.error(f"Failed to process doc {doc_id}: {e}")
 
-    # Step 9: Cycle metrics (aligned with email-extract-app.py format)
+    # Step 9: Cycle metrics
     duration = (datetime.now() - cycle_start).total_seconds()
     logger.info(
         f"Cycle completed in {duration:.2f}s: "
@@ -983,13 +869,18 @@ def process_opensearch_cycle():
 # ---------------------------------------------------------------------------
 
 def cleanup_and_exit():
-    """Gracefully shut down the scheduler and RabbitMQ connection before exiting."""
-    logger.info("🛑 Shutting down OpenSearch extractor...")
+    """Gracefully shut down the scheduler and connections before exiting."""
+    logger.info("🛑 Shutting down ELK extractor...")
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
     if rabbitmq_connection and not rabbitmq_connection.is_closed:
         try:
             rabbitmq_connection.close()
+        except Exception:
+            pass
+    if http_session:
+        try:
+            http_session.close()
         except Exception:
             pass
     sys.exit(0)
@@ -1010,23 +901,24 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     # Startup validation
-    if not Config.OPENSEARCH_URL:
-        logger.error("OPENSEARCH_URL is not configured. Cannot start.")
-        sys.exit(1)
-
-    if not Config.OPENSEARCH_INDEX:
-        logger.error("OPENSEARCH_INDEX is not configured. Cannot start.")
+    if not getattr(Config, 'ELK_SEARCH_URL', None):
+        logger.error("ELK_SEARCH_URL is not configured. Cannot start.")
         sys.exit(1)
 
     logger.info(
-        f"Starting OpenSearch Extractor | "
-        f"index={Config.OPENSEARCH_INDEX} | "
+        f"Starting ELK Extractor | "
         f"poll_interval={Config.POLL_INTERVAL_SECONDS}s | "
         f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min | "
         f"escalation_threshold={Config.HIGH_PRIORITY_THRESHOLD}"
     )
 
     # Initial connection setup at startup (fail-fast rather than silent)
+    try:
+        setup_http_session()
+        logger.info("✅ HTTP session ready")
+    except Exception as e:
+        logger.warning(f"⚠️ HTTP session setup failed: {e}.")
+
     try:
         setup_rabbitmq_connection()
         logger.info("✅ Initial RabbitMQ connection ready")
@@ -1041,11 +933,11 @@ if __name__ == "__main__":
 
     scheduler = BlockingScheduler()
     scheduler.add_job(
-        process_opensearch_cycle,
+        process_cycle,
         "interval",
         seconds=Config.POLL_INTERVAL_SECONDS,
-        max_instances=1,        # Prevent overlapping cycles if one runs long
-        coalesce=True           # Collapse missed executions into a single run
+        max_instances=1,    # Prevent overlapping cycles if one runs long
+        coalesce=True       # Collapse missed executions into a single run
     )
 
     logger.info(
@@ -1056,4 +948,7 @@ if __name__ == "__main__":
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
+        cleanup_and_exit()
+    except Exception as e:
+        logger.error(f"❌ Scheduler error: {e}", exc_info=True)
         cleanup_and_exit()

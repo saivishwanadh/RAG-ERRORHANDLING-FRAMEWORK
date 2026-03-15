@@ -131,6 +131,12 @@ GEMINI_URL=https://generativelanguage.googleapis.com/v1beta/models
 GEMINI_MODEL=gemini-2.5-flash
 GEMINI_APIKEY=your-gemini-api-key
 
+# Application Context for LLM (Optional)
+APP_PLATFORM_NAME="Enterprise Application"
+APP_PLATFORM_DOCS_URL="https://docs.example.com"
+APP_PLATFORM_TERMS="Components, Services, APIs"
+APP_PLATFORM_TONE="Technical expert, Actionable, Context-Aware"
+
 # Email (SMTP)
 SMTP_HOST=smtp.office365.com
 SMTP_PORT=587

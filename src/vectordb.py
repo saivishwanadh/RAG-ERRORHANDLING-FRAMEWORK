@@ -125,4 +125,3 @@ class QdrantStore:
             solutions.append(f"solution{index}: {solution_text}")
 
         return "\n".join(solutions)
-

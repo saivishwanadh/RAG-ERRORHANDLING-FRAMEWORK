@@ -20,6 +20,7 @@ from src.geminicall import GeminiClient
 from src.sendemail import EmailService
 from src.maskdata import LogSanitizer
 from src.service_alert import ServiceAlertNotifier
+from src.incident_manager import IncidentManager
 from src.config import Config
 
 # ---- Logging ----
@@ -133,6 +134,9 @@ class ServiceContainer:
 
         # Service health alert notifier (shared, cooldown-aware)
         self.alert = ServiceAlertNotifier()
+
+        # ITSM incident manager (loosely coupled — disabled when ITSM_PROVIDER=none)
+        self.incidents = IncidentManager()
 
     # ---- initialization ----
     def initialize(self):
@@ -479,6 +483,17 @@ def main():
                 'confirmedSolutions': solutions
             }
             send_formatted_email(email_payload, 'databasesol-main-ui.html')
+
+            # ITSM: create / update incident for this error (DB-verified solution path)
+            _err_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+            services.incidents.handle_error(
+                error_key=_err_key,
+                app_name=services.incoming_payload.get('applicationName', ''),
+                error_code=services.incoming_payload.get('code', ''),
+                description=services.incoming_payload.get('description', ''),
+                count=services.incoming_payload.get('occurrence_count', 1),
+                llm_summary=llmresponse.get('rootCause', '') or '',
+            )
             return
         else:
              logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
@@ -523,6 +538,18 @@ def main():
                 'confirmedSolutions': solutions
             }
             send_formatted_email(email_payload, 'databasesol-main-ui.html')
+
+            # ITSM: create / update incident for this error (VectorDB path)
+            error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+            llm_summary = llmresponse.get('rootCause', '') or ''
+            services.incidents.handle_error(
+                error_key=error_key,
+                app_name=services.incoming_payload.get('applicationName', ''),
+                error_code=services.incoming_payload.get('code', ''),
+                description=services.incoming_payload.get('description', ''),
+                count=services.incoming_payload.get('occurrence_count', 1),
+                llm_summary=llm_summary,
+            )
             return
 
     except Exception:
@@ -546,6 +573,18 @@ def main():
         'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')}
     }
     send_formatted_email(email_payload, 'email-main-ui.html')
+
+    # ITSM: create / update incident for this error (LLM-only path)
+    error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+    llm_summary = llmresponse.get('rootCause', '') or ''
+    services.incidents.handle_error(
+        error_key=error_key,
+        app_name=services.incoming_payload.get('applicationName', ''),
+        error_code=services.incoming_payload.get('code', ''),
+        description=services.incoming_payload.get('description', ''),
+        count=services.incoming_payload.get('occurrence_count', 1),
+        llm_summary=llm_summary,
+    )
 
 
 # ---- DLQ helper ----

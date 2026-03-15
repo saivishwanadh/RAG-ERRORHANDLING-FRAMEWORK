@@ -22,7 +22,7 @@ services:
     env_file: .env
     restart: always
     extra_hosts:
-      - "host.docker.internal:host-gateway"   # Allows container to reach host's OpenSearch
+      - "host.docker.internal:host-gateway" # Allows container to reach host's OpenSearch
     dns:
       - 8.8.8.8
 

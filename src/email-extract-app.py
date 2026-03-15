@@ -17,6 +17,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from src.config import Config
 from src.structuraldb import DB
 from src.service_alert import ServiceAlertNotifier
+from src.incident_manager import IncidentManager
 
 # Setup logging
 logging.basicConfig(
@@ -44,6 +45,9 @@ _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
 
 # Module-level service alert notifier (shared, cooldown-aware)
 _alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
+
+# ITSM Provider (ServiceNow)
+_incident_manager = IncidentManager()
 
 # Graph API Configuration
 # For Client Credentials, we usually use the /.default scope
@@ -304,7 +308,7 @@ def check_occurrence_count(app_name, code, desc, timestamp) -> int:
             return 0
 
         new_count = max(int(r['occurrence_count']) for r in rows)
-        logger.info(f"📈 {app_name}/{code}: occurrence_count → {new_count}")
+        logger.info(f"{app_name}/{code}: occurrence_count → {new_count}")
         return new_count
 
     except Exception as e:
@@ -393,7 +397,7 @@ def deduplicate_emails(emails: List[Dict]) -> List[Dict]:
             unique.append(email)  # Include if parsing fails
     
     if len(emails) != len(unique):
-        logger.info(f"📊 Batch deduplication: {len(emails)} raw → {len(unique)} unique")
+        logger.info(f"Batch deduplication: {len(emails)} raw → {len(unique)} unique")
     
     return unique
 
@@ -411,7 +415,7 @@ def send_high_priority_alert(app_name: str, code: str, description: str, count: 
         html_body = f"""
         <html><body style="font-family: Arial, sans-serif; color: #333;">
         <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
-            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
+            <h2 style="margin:0;">HIGH-PRIORITY ERROR ALERT</h2>
         </div>
         <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
             <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
@@ -436,7 +440,7 @@ def send_high_priority_alert(app_name: str, code: str, description: str, count: 
         """
 
         msg = EmailMessage()
-        msg["Subject"] = f"🚨 HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
+        msg["Subject"] = f"HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
         msg["From"] = Config.SMTP_USERNAME
         msg["To"] = to_email
         msg.set_content(f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. Check HTML version.")
@@ -449,7 +453,7 @@ def send_high_priority_alert(app_name: str, code: str, description: str, count: 
             s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
             s.send_message(msg)
 
-        logger.warning(f"🚨 HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
+        logger.warning(f"HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
 
     except Exception as e:
         logger.error(f"Failed to send high-priority alert: {e}")
@@ -637,7 +641,7 @@ def process_email_cycle():
                             cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
                             if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                                 logger.warning(
-                                    f"🚨 ESCALATION TRIGGERED (within-cycle): "
+                                    f"ESCALATION TRIGGERED (within-cycle): "
                                     f"{payload['applicationName']}/{payload['code']} "
                                     f"occurred {new_db_count}x "
                                     f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
@@ -653,7 +657,7 @@ def process_email_cycle():
                             else:
                                 minutes_since = (now_utc - last_alert).total_seconds() / 60
                                 logger.info(
-                                    f"⏸️ Escalation cooldown active for {payload['code']} "
+                                    f"Escalation cooldown active for {payload['code']} "
                                     f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                                 )
 
@@ -689,7 +693,7 @@ def process_email_cycle():
                         if age > cache_ttl:
                             # Cache entry expired — treat as a fresh new error
                             logger.info(
-                                f"🔄 Cache expired for {payload['code']} "
+                                f"Cache expired for {payload['code']} "
                                 f"({age.total_seconds()/60:.1f}min > {Config.DB_DUPLICATE_WINDOW_MINUTES}min TTL). "
                                 f"Treating as new."
                             )
@@ -701,7 +705,7 @@ def process_email_cycle():
                             _published_cache[cycle_key] = (pub_time, mem_count)
                             count = mem_count
                             logger.info(
-                                f"⏳ Async gap duplicate: {payload['code']} "
+                                f"Async gap duplicate: {payload['code']} "
                                 f"(in-memory count={mem_count}, DB not yet updated by consumer)"
                             )
 
@@ -735,9 +739,20 @@ def process_email_cycle():
                             error_key = (payload['applicationName'], payload['code'])
                             last_alert = escalation_cooldown.get(error_key)
                             cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+                            
+                            # ITSM: open/escalate ServiceNow incident for high-priority burst
+                            _itsm_key = f"{payload['applicationName']}_{payload['code']}"
+                            _incident_manager.handle_high_priority(
+                                error_key=_itsm_key,
+                                app_name=payload['applicationName'],
+                                error_code=payload['code'],
+                                description=payload['description'],
+                                count=batch_count,
+                            )
+
                             if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                                 logger.warning(
-                                    f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
+                                    f"ESCALATION TRIGGERED (batch count={batch_count}): "
                                     f"{payload['applicationName']}/{payload['code']} "
                                     f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                                 )
@@ -758,6 +773,17 @@ def process_email_cycle():
                         f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
                         f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                     )
+                    
+                    # ITSM: update the existing ticket with recurrence note
+                    _itsm_key = f"{payload['applicationName']}_{payload['code']}"
+                    _incident_manager.handle_error(
+                        error_key=_itsm_key,
+                        app_name=payload['applicationName'],
+                        error_code=payload['code'],
+                        description=payload['description'],
+                        count=count,
+                    )
+
                     skipped_duplicate += 1
 
                 else:
@@ -766,9 +792,19 @@ def process_email_cycle():
                     last_alert = escalation_cooldown.get(error_key)
                     cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
 
+                    # ITSM: always update to high-priority (has its own suppression logic)
+                    _itsm_key = f"{payload['applicationName']}_{payload['code']}"
+                    _incident_manager.handle_high_priority(
+                        error_key=_itsm_key,
+                        app_name=payload['applicationName'],
+                        error_code=payload['code'],
+                        description=payload['description'],
+                        count=count,
+                    )
+
                     if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                         logger.warning(
-                            f"🚨 ESCALATION TRIGGERED: {payload['applicationName']}/{payload['code']} "
+                            f"ESCALATION TRIGGERED: {payload['applicationName']}/{payload['code']} "
                             f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                         )
                         send_high_priority_alert(
@@ -782,7 +818,7 @@ def process_email_cycle():
                     else:
                         minutes_since = (now_utc - last_alert).total_seconds() / 60
                         logger.info(
-                            f"⏸️ Escalation cooldown active for {payload['code']} "
+                            f"Escalation cooldown active for {payload['code']} "
                             f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
                         )
 
@@ -797,7 +833,7 @@ def process_email_cycle():
     # Cycle metrics
     duration = (datetime.now() - cycle_start).total_seconds()
     logger.info(
-        f"📊 Cycle completed in {duration:.2f}s: "
+        f"Cycle completed in {duration:.2f}s: "
         f"total={len(emails) if 'emails' in locals() else 0}, "
         f"filtered={len(filtered_emails) if 'filtered_emails' in locals() else 0}, "
         f"processed={processed}, published={published}, "
@@ -826,7 +862,7 @@ if __name__ == "__main__":
     if "your-tenant-id" in Config.AZURE_TENANT_ID:
          logger.warning("AZURE_TENANT_ID is set to default 'your-tenant-id'. Connection may fail.")
 
-    logger.info(f"🚀 Starting Email Extractor (Service Principal) for {Config.AZURE_TARGET_EMAIL}")
+    logger.info(f"Starting Email Extractor (Service Principal) for {Config.AZURE_TARGET_EMAIL}")
     
     scheduler = BlockingScheduler()
     # Runs every X seconds

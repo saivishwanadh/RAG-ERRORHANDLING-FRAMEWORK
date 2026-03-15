@@ -23,7 +23,7 @@ class DB:
             logger.error(f"❌ DB connection failed: {e}")
             raise e
 
-    def execute(self, query: str, params: Optional[Tuple] = None, fetch: bool = False) -> Optional[List[dict]]:
+    def execute(self, query: str, params: Optional[Tuple] = None, fetch: bool = False, retry: bool = True) -> Optional[List[dict]]:
         """
         Execute a query safely.
         
@@ -31,13 +31,14 @@ class DB:
             query: SQL string
             params: tuple of parameters
             fetch: set True for SELECT queries
+            retry: whether to retry on dropped connection
             
         Returns:
             List of dicts if fetch=True, else None
         """
         try:
             # Reconnect if connection closed
-            if self.conn is None or self.conn.closed:
+            if self.conn is None or getattr(self.conn, 'closed', True):
                 self.connect()
 
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -51,6 +52,21 @@ class DB:
                 self.conn.commit()
                 return None
 
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Connection dropped or SSL closed unexpectedly
+            if retry:
+                logger.warning(f"🔄 DB connection dropped ({e}), forcing reconnect and retry...")
+                self.conn = None
+                return self.execute(query, params, fetch=fetch, retry=False)
+            
+            logger.error(f"❌ SQL ERROR: {str(e)} | QUERY: {query}")
+            if self.conn:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+            raise e
+            
         except psycopg2.Error as e:
             logger.error(f"❌ SQL ERROR: {str(e)} | QUERY: {query}")
             if self.conn:
