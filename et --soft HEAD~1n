@@ -1,0 +1,118 @@
+[1mdiff --git a/src/incident_manager.py b/src/incident_manager.py[m
+[1mindex 277a899..3ffe51d 100644[m
+[1m--- a/src/incident_manager.py[m
+[1m+++ b/src/incident_manager.py[m
+[36m@@ -81,6 +81,14 @@[m [mclass IncidentProvider(ABC):[m
+     ) -> None:[m
+         """Append notes to an existing incident and optionally change its priority."""[m
+ [m
+[32m+[m[32m    @abstractmethod[m
+[32m+[m[32m    def resolve_incident([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        incident_id: str,[m
+[32m+[m[32m        resolution_notes: str,[m
+[32m+[m[32m    ) -> None:[m
+[32m+[m[32m        """Mark the incident as resolved (state=6) in the provider system."""[m
+[32m+[m
+     @abstractmethod[m
+     def is_incident_active(self, incident_id: str) -> bool:[m
+         """Return True if the incident is still open / not resolved."""[m
+[36m@@ -123,7 +131,11 @@[m [mclass ServiceNowProvider(IncidentProvider):[m
+ [m
+     def _patch(self, sys_id: str, payload: dict) -> dict:[m
+         resp = self._session.patch(self._url(f"/{sys_id}"), json=payload, timeout=30)[m
+[31m-        resp.raise_for_status()[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            resp.raise_for_status()[m
+[32m+[m[32m        except requests.exceptions.HTTPError as e:[m
+[32m+[m[32m            logger.error(f"[IncidentManager] ServiceNow API Error: {resp.text}")[m
+[32m+[m[32m            raise e[m
+         return resp.json().get("result", {})[m
+ [m
+     def _get(self, sys_id: str) -> dict:[m
+[36m@@ -181,6 +193,21 @@[m [mclass ServiceNowProvider(IncidentProvider):[m
+             f"priority_change={priority}"[m
+         )[m
+ [m
+[32m+[m[32m    def resolve_incident([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        incident_id: str,[m
+[32m+[m[32m        resolution_notes: str,[m
+[32m+[m[32m    ) -> None:[m
+[32m+[m[32m        body: dict = {[m
+[32m+[m[32m            "state": "6", # 6 = Resolved[m
+[32m+[m[32m            "close_notes": resolution_notes,[m
+[32m+[m[32m            "close_code": "Workaround provided",[m
+[32m+[m[32m        }[m
+[32m+[m[32m        self._patch(incident_id, body)[m
+[32m+[m[32m        logger.info([m
+[32m+[m[32m            f"[IncidentManager] ServiceNow incident resolved: sys_id={incident_id}"[m
+[32m+[m[32m        )[m
+[32m+[m
+     def is_incident_active(self, incident_id: str) -> bool:[m
+         """Returns True when state != 6 (Resolved) and != 7 (Closed)."""[m
+         try:[m
+[36m@@ -472,6 +499,31 @@[m [mclass IncidentManager:[m
+         except Exception as exc:[m
+             logger.error(f"[IncidentManager] Failed to escalate via high-priority: {exc}")[m
+ [m
+[32m+[m[32m    def resolve_ticket(self, error_key: str, resolution_notes: str) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Called when a verified solution is submitted via UI (ops_solution.py).[m
+[32m+[m[32m        1. Look up active ticket[m
+[32m+[m[32m        2. Resolve it in provider[m
+[32m+[m[32m        3. Delete local tracking so it triggers a fresh ticket next time[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if not self._ensure_ready():[m
+[32m+[m[32m            return[m
+[32m+[m[41m            [m
+[32m+[m[32m        record = self._get_record(error_key)[m
+[32m+[m[32m        if not record:[m
+[32m+[m[32m            logger.info(f"[IncidentManager] Cannot resolve ticket for '{error_key}' — no active ticket tracked.")[m
+[32m+[m[32m            return[m
+[32m+[m[41m            [m
+[32m+[m[32m        incident_id = record["incident_id"][m
+[32m+[m[32m        display_name = record["incident_display"][m
+[32m+[m[41m        [m
+[32m+[m[32m        try:[m
+[32m+[m[32m            self._provider.resolve_incident(incident_id, resolution_notes)[m
+[32m+[m[32m            self._mark_closed(error_key)[m
+[32m+[m[32m            logger.info(f"[IncidentManager] Successfully resolved ticket {display_name} for '{error_key}'.")[m
+[32m+[m[32m        except Exception as exc:[m
+[32m+[m[32m            logger.error(f"[IncidentManager] Failed to resolve ticket {display_name}: {exc}")[m
+[32m+[m
+     # -- internal helpers ------------------------------------------------[m
+ [m
+     def _create_new([m
+[1mdiff --git a/src/ops_solution.py b/src/ops_solution.py[m
+[1mindex efa925f..c789415 100644[m
+[1m--- a/src/ops_solution.py[m
+[1m+++ b/src/ops_solution.py[m
+[36m@@ -13,6 +13,7 @@[m [mfrom src.config import Config[m
+ from src.embeddingmodel import EmbeddingGenerator[m
+ from src.vectordb import QdrantStore[m
+ from src.structuraldb import DB[m
+[32m+[m[32mfrom src.incident_manager import IncidentManager[m
+ [m
+ # Setup logging[m
+ logger = logging.getLogger(__name__)[m
+[36m@@ -20,6 +21,8 @@[m [mlogger = logging.getLogger(__name__)[m
+ # Initialize FastAPI[m
+ app = FastAPI()[m
+ [m
+[32m+[m[32m_incident_manager = IncidentManager()[m
+[32m+[m
+ app.add_middleware([m
+     CORSMiddleware,[m
+     allow_origins=["*"],[m
+[36m@@ -227,6 +230,10 @@[m [masync def update_vector([m
+     clean_desc = clean_error_description(record["error_description"])[m
+     embed_input = f"Error:{record['error_code']} Description:{clean_desc.get('cleanText', '')}"[m
+     [m
+[32m+[m[32m    # ITSM: Auto-resolve if ticket exists[m
+[32m+[m[32m    _itsm_key = f"{record['application_name']}_{record['error_code']}"[m
+[32m+[m[32m    _incident_manager.resolve_ticket(_itsm_key, resolution_notes=custom_solution)[m
+[32m+[m[41m    [m
+     # Generate Embedding[m
+     raw_embedding_input = embed_gen.get_embedding(embed_input)[m
+     [m

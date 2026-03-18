@@ -82,6 +82,14 @@ class IncidentProvider(ABC):
         """Append notes to an existing incident and optionally change its priority."""
 
     @abstractmethod
+    def resolve_incident(
+        self,
+        incident_id: str,
+        resolution_notes: str,
+    ) -> None:
+        """Mark the incident as resolved (state=6) in the provider system."""
+
+    @abstractmethod
     def is_incident_active(self, incident_id: str) -> bool:
         """Return True if the incident is still open / not resolved."""
 
@@ -123,7 +131,11 @@ class ServiceNowProvider(IncidentProvider):
 
     def _patch(self, sys_id: str, payload: dict) -> dict:
         resp = self._session.patch(self._url(f"/{sys_id}"), json=payload, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"[IncidentManager] ServiceNow API Error: {resp.text}")
+            raise e
         return resp.json().get("result", {})
 
     def _get(self, sys_id: str) -> dict:
@@ -179,6 +191,21 @@ class ServiceNowProvider(IncidentProvider):
         logger.info(
             f"[IncidentManager] ServiceNow incident updated: sys_id={incident_id}, "
             f"priority_change={priority}"
+        )
+
+    def resolve_incident(
+        self,
+        incident_id: str,
+        resolution_notes: str,
+    ) -> None:
+        body: dict = {
+            "state": "6", # 6 = Resolved
+            "close_notes": resolution_notes,
+            "close_code": "Workaround provided",
+        }
+        self._patch(incident_id, body)
+        logger.info(
+            f"[IncidentManager] ServiceNow incident resolved: sys_id={incident_id}"
         )
 
     def is_incident_active(self, incident_id: str) -> bool:
@@ -472,6 +499,31 @@ class IncidentManager:
         except Exception as exc:
             logger.error(f"[IncidentManager] Failed to escalate via high-priority: {exc}")
 
+    def resolve_ticket(self, error_key: str, resolution_notes: str) -> None:
+        """
+        Called when a verified solution is submitted via UI (ops_solution.py).
+        1. Look up active ticket
+        2. Resolve it in provider
+        3. Delete local tracking so it triggers a fresh ticket next time
+        """
+        if not self._ensure_ready():
+            return
+            
+        record = self._get_record(error_key)
+        if not record:
+            logger.info(f"[IncidentManager] Cannot resolve ticket for '{error_key}' — no active ticket tracked.")
+            return
+            
+        incident_id = record["incident_id"]
+        display_name = record["incident_display"]
+        
+        try:
+            self._provider.resolve_incident(incident_id, resolution_notes)
+            self._mark_closed(error_key)
+            logger.info(f"[IncidentManager] Successfully resolved ticket {display_name} for '{error_key}'.")
+        except Exception as exc:
+            logger.error(f"[IncidentManager] Failed to resolve ticket {display_name}: {exc}")
+
     # -- internal helpers ------------------------------------------------
 
     def _create_new(
@@ -488,7 +540,6 @@ class IncidentManager:
         body = (
             f"Application: {app_name}\n"
             f"Error Code:  {error_code}\n"
-            f"Occurrences: {count}\n\n"
             f"Description:\n{description[:1000]}\n\n"
             f"Opssolver Analysis:\n{llm_summary or 'Pending analysis'}"
         )

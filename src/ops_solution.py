@@ -13,12 +13,15 @@ from src.config import Config
 from src.embeddingmodel import EmbeddingGenerator
 from src.vectordb import QdrantStore
 from src.structuraldb import DB
+from src.incident_manager import IncidentManager
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI()
+
+_incident_manager = IncidentManager()
 
 app.add_middleware(
     CORSMiddleware,
@@ -226,6 +229,10 @@ async def update_vector(
     
     clean_desc = clean_error_description(record["error_description"])
     embed_input = f"Error:{record['error_code']} Description:{clean_desc.get('cleanText', '')}"
+    
+    # ITSM: Auto-resolve if ticket exists
+    _itsm_key = f"{record['application_name']}_{record['error_code']}"
+    _incident_manager.resolve_ticket(_itsm_key, resolution_notes=custom_solution)
     
     # Generate Embedding
     raw_embedding_input = embed_gen.get_embedding(embed_input)
