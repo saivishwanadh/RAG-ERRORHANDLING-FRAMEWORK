@@ -15,7 +15,6 @@ import pika
 
 from src.config import Config
 from src.service_alert import ServiceAlertNotifier
-from src.incident_manager import IncidentManager
 
 # Setup logging
 logging.basicConfig(
@@ -35,9 +34,6 @@ http_session: Optional[requests.Session] = None
 
 # Persistent PostgreSQL connection — reused across all poll cycles
 _db_conn: Optional[psycopg2.extensions.connection] = None
-
-# ITSM Provider (ServiceNow)
-_incident_manager = IncidentManager()
 
 # In-memory escalation cooldown tracker: { (app_name, error_code) -> last_alert_datetime }
 escalation_cooldown: Dict[tuple, datetime] = {}
@@ -664,15 +660,6 @@ def process_cycle():
                         error_key = (payload['applicationName'], payload['code'])
                         last_alert = escalation_cooldown.get(error_key)
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-                        # ITSM: always escalate (has its own internal suppression)
-                        _itsm_key = f"{payload['applicationName']}_{payload['code']}"
-                        _incident_manager.handle_high_priority(
-                            error_key=_itsm_key,
-                            app_name=payload['applicationName'],
-                            error_code=payload['code'],
-                            description=payload['description'],
-                            count=new_db_count,
-                        )
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                             logger.warning(
                                 f"ESCALATION TRIGGERED (within-cycle): "
@@ -786,23 +773,7 @@ def process_cycle():
                                 count=batch_count,
                                 timestamp=error_timestamp
                             )
-                            # ITSM: open/escalate ServiceNow incident for high-priority burst
-                            _itsm_key = f"{payload['applicationName']}_{payload['code']}"
-                            _incident_manager.handle_high_priority(
-                                error_key=_itsm_key,
-                                app_name=payload['applicationName'],
-                                error_code=payload['code'],
-                                description=payload['description'],
-                                count=batch_count,
-                            )
                             escalation_cooldown[error_key] = now_utc
-                        else:
-                            minutes_since = (now_utc - last_alert).total_seconds() / 60
-                            logger.info(
-                                f"Escalation email cooldown active for {payload['code']} "
-                                f"({minutes_since:.1f}min ago, "
-                                f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
-                            )
                 else:
                     logger.error("❌ RabbitMQ channel unavailable. Will retry next cycle.")
 
@@ -812,17 +783,6 @@ def process_cycle():
                     f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
                     f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
                 )
-                
-                # ITSM: update the existing ticket with recurrence note
-                _itsm_key = f"{payload['applicationName']}_{payload['code']}"
-                _incident_manager.handle_error(
-                    error_key=_itsm_key,
-                    app_name=payload['applicationName'],
-                    error_code=payload['code'],
-                    description=payload['description'],
-                    count=count,
-                )
-                
                 skipped_duplicate += 1
 
             else:
@@ -830,16 +790,6 @@ def process_cycle():
                 error_key = (payload['applicationName'], payload['code'])
                 last_alert = escalation_cooldown.get(error_key)
                 cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-
-                # ITSM: always update to high-priority (has its own suppression logic)
-                _itsm_key = f"{payload['applicationName']}_{payload['code']}"
-                _incident_manager.handle_high_priority(
-                    error_key=_itsm_key,
-                    app_name=payload['applicationName'],
-                    error_code=payload['code'],
-                    description=payload['description'],
-                    count=count,
-                )
 
                 if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                     logger.warning(
