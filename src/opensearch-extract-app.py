@@ -801,7 +801,11 @@ def process_opensearch_cycle():
                 skipped_duplicate += 1
                 continue
 
-            # Layer 1: DB atomic UPDATE...RETURNING
+
+
+
+
+            # Layer 1: DB atomic UPDATE...RETURNING  f
             count = check_occurrence_count(
                 payload["applicationName"], payload["code"],
                 payload["description"], error_timestamp
