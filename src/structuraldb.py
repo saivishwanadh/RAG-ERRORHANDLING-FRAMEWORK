@@ -18,7 +18,7 @@ class DB:
         try:
             if self.conn is None or self.conn.closed:
                 self.conn = psycopg2.connect(self.conn_string)
-                logger.info("✅ PostgreSQL connection established")
+                logger.debug("PostgreSQL connection established")
         except Exception as e:
             logger.error(f"❌ DB connection failed: {e}")
             raise e
@@ -85,7 +85,7 @@ class DB:
         try:
             if self.conn and not self.conn.closed:
                 self.conn.close()
-                logger.info("❎ DB connection closed")
+                logger.debug("DB connection closed")
         except Exception as e:
             logger.error(f"Error closing DB: {e}")
         finally:

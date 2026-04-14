@@ -30,7 +30,7 @@ class GeminiClient:
             model_kwargs={"response_mime_type": "application/json"}
         )
         self.prompt_builder = PromptBuilder()
-        logger.info(f"Initialized GeminiClient (LangChain) with model: {self.model}")
+        logger.debug(f"GeminiClient initialized with model: {self.model}")
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         """Extract JSON from response, handling potential trailing commas"""
@@ -60,7 +60,7 @@ class GeminiClient:
         chain = prompt_template | self.llm
         
         try:
-            logger.info("Invoking Gemini via LangChain chain...")
+            logger.debug("Invoking Gemini via LangChain chain...")
             
             # Context handling: If None or empty, provide a fallback "None" string so template parses
             context_val = context if context else "None"
@@ -72,7 +72,7 @@ class GeminiClient:
             })
             
             content = response_msg.content
-            logger.info("Received response from Gemini (LangChain)")
+            logger.debug("Received response from Gemini (LangChain)")
             return self._extract_json(content)
             
         except Exception as e:

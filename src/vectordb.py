@@ -35,7 +35,7 @@ class QdrantStore:
             collection_name=self.collection_name,
             embedding=self.embedding_model
         )
-        logger.info("✅ Connected to Vector DB via LangChain")
+        logger.debug("Connected to Vector DB via LangChain")
 
     def list_collections(self):
         """Return list of collections."""

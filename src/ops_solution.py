@@ -15,8 +15,10 @@ from src.vectordb import QdrantStore
 from src.structuraldb import DB
 from src.incident_manager import IncidentManager
 
-# Setup logging
-logger = logging.getLogger(__name__)
+from src.logger_config import get_logger, set_correlation_id
+
+# Structured JSON logger — shares the same centralized config as all services
+logger = get_logger("api")
 
 # Initialize FastAPI
 app = FastAPI()
@@ -30,6 +32,48 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# JSON Access Log Middleware
+# Replaces Uvicorn plain-text access logs with structured JSON output.
+# ---------------------------------------------------------------------------
+import time as _time
+
+@app.middleware("http")
+async def json_access_log(request: Request, call_next):
+    start = _time.perf_counter()
+
+    # Extract correlation token from query params (session ID doubles as trace ID)
+    token = request.query_params.get("token", "")
+    if token:
+        set_correlation_id(token[:8] + "...")  # Log prefix only — never full token
+
+    response = await call_next(request)
+
+    duration_ms = round((_time.perf_counter() - start) * 1000, 1)
+    level = "WARNING" if response.status_code >= 400 else "INFO"
+
+    log_data = {
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "duration_ms": duration_ms,
+        "client": request.client.host if request.client else "-",
+    }
+
+    # Append query params selectively (skip full token for security)
+    q = dict(request.query_params)
+    if "token" in q:
+        q["token"] = q["token"][:8] + "..."
+    if q:
+        log_data["query"] = q
+
+    getattr(logger, level.lower())(
+        f"{request.method} {request.url.path} → {response.status_code} ({duration_ms}ms)",
+        extra=log_data
+    )
+
+    return response
 
 # Dependencies
 def get_db():
@@ -122,7 +166,7 @@ async def load_solution(request: Request, db: DB = Depends(get_db)):
     }
     
     selected_solution = extract_solution(payload.get("solution"), solution_id)
-    
+    logger.info(f"Feedback UI loaded: error_id={payload.get('errorId')} code={payload.get('errorType')} solution_id={solution_id}")
     html_template = get_ui_template("llm-suggested-submit-ui.html")
     
     html = (
@@ -194,6 +238,7 @@ async def update_vector(
         raise HTTPException(status_code=404, detail="Record not found")
     
     if rows[0]["sessionid_status"] != "active":
+        logger.warning(f"Session expired for error_id={record_id} — submission rejected")
         return JSONResponse(
             content={"error": "Session Expired", "status": "inactive", "message": "Your session has expired"},
             status_code=404
@@ -249,6 +294,7 @@ async def update_vector(
         }
     )
     
+    logger.info(f"Solution submitted and vector DB updated: error_id={record_id} app={record.get('application_name')} code={record.get('error_code')}")
     return {"message": "Vector DB updated successfully", "status": "SUCCESS"}
 
 class SolutionIngestRequest(BaseModel):
@@ -292,7 +338,7 @@ async def ingest_solution(
             }
         )
         
-        logger.info(f"Manually ingested solution for {item.error_code} (ID: {new_id})")
+        logger.info(f"Solution manually ingested: error_code={item.error_code} vector_id={new_id}")
         return {"status": "SUCCESS", "message": "Solution ingested", "id": new_id}
         
     except Exception as e:

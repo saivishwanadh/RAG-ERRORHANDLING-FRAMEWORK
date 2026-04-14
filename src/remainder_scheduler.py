@@ -19,16 +19,13 @@ from src.structuraldb import DB
 from src.sendemail import EmailService
 from src.config import Config
 from src.incident_manager import IncidentManager
+from src.logger_config import get_logger
 
 # Module-level incident manager
 _incident_manager = IncidentManager()
 
-# Logging setup
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper()),
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Structured JSON logger — service-tagged, sensitive-data masked
+logger = get_logger("scheduler")
 
 
 # ============================================================================
@@ -46,9 +43,7 @@ class SchedulerService:
     def initialize(self):
         """Initialize all services with error handling."""
         try:
-            logger.info("=" * 70)
-            logger.info("Initializing Reminder Scheduler services...")
-            logger.info("=" * 70)
+            logger.debug("Initializing Reminder Scheduler services...")
             
             Config.validate()
             
@@ -56,7 +51,7 @@ class SchedulerService:
             try:
                 with DB() as db:
                     db.execute("SELECT 1", fetch=True)
-                logger.info("✅ Database connection initialized")
+                logger.debug("Database connection verified")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Database: {e}", exc_info=True)
                 raise
@@ -64,16 +59,12 @@ class SchedulerService:
             # Initialize Email Service
             try:
                 self.email_service = EmailService("email-main-ui.html")
-                logger.info("✅ Email service initialized")
+                logger.debug("Email service initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Email service: {e}", exc_info=True)
                 raise
             
-            logger.info("✅ All services initialized successfully")
-            logger.info(f"Configuration:")
-            logger.info(f"   - Reminder interval: {Config.REMINDER_INTERVAL_HOURS} hours")
-            logger.info(f"   - Max retries: {Config.MAX_RETRY_COUNT}")
-            logger.info(f"   - Environment: {Config.ENVIRONMENT}")
+            logger.debug(f"Scheduler config: interval={Config.REMINDER_INTERVAL_HOURS}h, max_retries={Config.MAX_RETRY_COUNT}")
             
         except Exception as e:
             logger.error(f"❌ Service initialization failed: {e}", exc_info=True)
@@ -85,15 +76,7 @@ class SchedulerService:
             return
         
         self._is_shutting_down = True
-        logger.info("=" * 70)
-        logger.info("🧹 Cleaning up resources...")
-        logger.info("=" * 70)
-        
-        # Database connection closes automatically via context manager when used
-        
-        logger.info("=" * 70)
-        logger.info("✅ Cleanup complete")
-        logger.info("=" * 70)
+        logger.debug("Cleaning up scheduler resources...")
 
 
 # Global service instance
@@ -191,7 +174,7 @@ def update_retry_count(record_id: int) -> bool:
         """
         with DB() as db:
             db.execute(update_sql, (record_id,))
-        logger.info(f"✅ Updated retry count for ID {record_id}")
+        logger.debug(f"Retry count incremented for error ID {record_id}")
         return True
         
     except Exception as e:

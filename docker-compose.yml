@@ -12,6 +12,11 @@ services:
     restart: always
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   extractor:
     build:
@@ -25,6 +30,11 @@ services:
       - "host.docker.internal:host-gateway" # Allows container to reach host's OpenSearch
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   scheduler:
     build:
@@ -36,6 +46,11 @@ services:
     restart: always
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   consumer:
     build:
@@ -47,3 +62,8 @@ services:
     restart: always
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

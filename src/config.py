@@ -129,10 +129,3 @@ class Config:
         missing = [key for key in required if not getattr(cls, key)]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-
-# Setup central logging configuration
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper()),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
-)
-logger = logging.getLogger(__name__)

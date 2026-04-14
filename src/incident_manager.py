@@ -284,9 +284,9 @@ class IncidentManager:
         if self._enabled:
             self._db = DB()  # persistent connection
             self._provider = self._load_provider(self._provider_name)
-            logger.info(f"[IncidentManager] Initialized with provider={self._provider_name}")
+            logger.debug(f"[IncidentManager] Initialized with provider={self._provider_name}")
         else:
-            logger.info("[IncidentManager] ITSM integration disabled (ITSM_PROVIDER=none).")
+            logger.debug("[IncidentManager] ITSM integration disabled (ITSM_PROVIDER=none).")
 
     def __del__(self):
         if hasattr(self, "_db") and self._db:
@@ -308,7 +308,7 @@ class IncidentManager:
         """
         if self._db:
             self._db.execute(sql)
-            logger.info("[IncidentManager] itsm_incidents table ensured.")
+            logger.debug("[IncidentManager] itsm_incidents table ensured.")
 
     def _ensure_ready(self) -> bool:
         """Create the DB table on first use and return True if ITSM is enabled.

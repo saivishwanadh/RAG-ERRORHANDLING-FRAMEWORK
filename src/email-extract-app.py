@@ -18,13 +18,10 @@ from src.config import Config
 from src.structuraldb import DB
 from src.service_alert import ServiceAlertNotifier
 from src.incident_manager import IncidentManager
+from src.logger_config import get_logger, set_correlation_id
 
-# Setup logging
-logging.basicConfig(
-    level=Config.LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Structured JSON logger — service-tagged, sensitive-data masked
+logger = get_logger("email-extractor")
 
 # Global variables
 rabbitmq_connection: Optional[pika.BlockingConnection] = None
@@ -60,7 +57,7 @@ def get_persistent_db() -> psycopg2.extensions.connection:
     try:
         if _db_conn is None or _db_conn.closed:
             _db_conn = psycopg2.connect(Config.DB_URL)
-            logger.info("✅ Persistent DB connection established")
+            logger.debug("Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
         _alert_notifier.notify_service_down(
@@ -100,7 +97,7 @@ def setup_rabbitmq_connection():
 
         if conn_alive and not channel_alive:
             # Connection alive but channel dead — just recreate channel
-            logger.info("RabbitMQ: connection alive, recreating channel...")
+            logger.debug("RabbitMQ: connection alive, recreating channel...")
             rabbitmq_channel = rabbitmq_connection.channel()
             rabbitmq_channel.exchange_declare(
                 exchange=Config.EXCHANGE,
@@ -108,11 +105,11 @@ def setup_rabbitmq_connection():
                 durable=True
             )
             rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-            logger.info("RabbitMQ channel restored")
+            logger.debug("RabbitMQ channel restored")
             return
 
         # Full reconnect needed
-        logger.info("Establishing new RabbitMQ connection...")
+        logger.debug("Establishing new RabbitMQ connection...")
         params = pika.URLParameters(Config.RABBIT_URL)
         params.heartbeat = 120               # Heartbeat every 120s (> 60s poll interval)
         params.blocked_connection_timeout = 30
@@ -129,7 +126,7 @@ def setup_rabbitmq_connection():
             durable=True
         )
         rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-        logger.info("✅ RabbitMQ connection established (heartbeat=120s)")
+        logger.debug("RabbitMQ connection established (heartbeat=120s)")
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
@@ -255,9 +252,8 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         # Fallback: use subject as description
         description = f"{subject} - (parse error)"
 
-    logger.info(
-        f"Parsed email: app={app_name}, correlationId={correlation_id}, "
-        f"code={error_code}, timestamp={email_timestamp}, desc_len={len(description)}"
+    logger.debug(
+        f"Parsed email: app={app_name}, code={error_code}, desc_len={len(description)}"
     )
 
     return {

@@ -22,13 +22,10 @@ from src.maskdata import LogSanitizer
 from src.service_alert import ServiceAlertNotifier
 from src.incident_manager import IncidentManager
 from src.config import Config
+from src.logger_config import get_logger, set_correlation_id
 
-# ---- Logging ----
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper()),
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Structured JSON logger — service-tagged, correlation ID per message
+logger = get_logger("consumer")
 
 # ---- Constants ----
 PREFETCH_COUNT = int(getattr(Config, "PREFETCH_COUNT", 1) or 1)
@@ -140,13 +137,13 @@ class ServiceContainer:
 
     # ---- initialization ----
     def initialize(self):
-        logger.info("Initializing services...")
+        logger.debug("Initializing services...")
         Config.validate()
 
         # Embedding
         try:
             self.embed_gen = EmbeddingGenerator(api_key=Config.GEMINI_APIKEY)
-            logger.info("Embedding generator initialized")
+            logger.debug("Embedding generator initialized")
         except Exception as e:
             logger.exception("Failed to init Embedding generator")
             self.alert.notify_service_down(
@@ -157,7 +154,7 @@ class ServiceContainer:
         # Qdrant
         try:
             self.store = QdrantStore(embedding_model=self.embed_gen.embeddings)
-            logger.info("Qdrant initialized")
+            logger.debug("Qdrant initialized")
         except Exception as e:
             logger.exception("Failed to init Qdrant")
             self.alert.notify_service_down(
@@ -168,7 +165,7 @@ class ServiceContainer:
         # Gemini
         try:
             self.client = GeminiClient(api_key=Config.GEMINI_APIKEY)
-            logger.info("Gemini initialized")
+            logger.debug("Gemini initialized")
         except Exception as e:
             logger.exception("Failed to init Gemini")
             self.alert.notify_service_down(
@@ -179,7 +176,7 @@ class ServiceContainer:
         # Sanitizer
         try:
             self.sanitizer = LogSanitizer()
-            logger.info("Sanitizer initialized")
+            logger.debug("Sanitizer initialized")
         except Exception as e:
             logger.exception("Failed to init sanitizer")
             raise
@@ -188,7 +185,7 @@ class ServiceContainer:
         try:
             with DB() as db:
                 db.execute("SELECT 1", fetch=True)
-            logger.info("DB reachable")
+            logger.debug("DB reachable")
         except Exception as e:
             logger.exception("DB init failure")
             self.alert.notify_service_down(
@@ -209,7 +206,7 @@ class ServiceContainer:
         self.channel.basic_qos(prefetch_count=PREFETCH_COUNT)
         # declare passive ensures queue exists
         self.channel.queue_declare(queue=Config.QUEUE, passive=True)
-        logger.info("RabbitMQ connected")
+        logger.debug("RabbitMQ connected")
 
     # DB execute with retry and circuit breaker
     @retry(exceptions=(Exception,), max_attempts=3)
@@ -361,8 +358,9 @@ def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]):
     services.incoming_payload = payload
     services.sanitizer = services.sanitizer or LogSanitizer()
     services.masked_errordescription = services.sanitizer.sanitize(payload.get('description', ''))
-    logger.info(f"Masked Data: {services.masked_errordescription}")
+    logger.debug(f"Masked description prepared for processing")
     services.sessionid = str(uuid.uuid4())
+    set_correlation_id(services.sessionid)  # All subsequent log lines carry this trace ID
     logger.info(f"Processing: App={payload.get('applicationName')} Code={payload.get('code')} Session={services.sessionid}")
 
 
@@ -399,7 +397,7 @@ def db_insert(llmresponse: dict):
     )
 
     inserted_rows = services.db_execute(insert_sql, params, fetch=True)
-    logger.info("Inserted structural DB row")
+    logger.debug("Inserted record into structural DB")
     if inserted_rows and len(inserted_rows) > 0:
         new_id = inserted_rows[0].get('id') if isinstance(inserted_rows[0], dict) else inserted_rows[0][0]
     else:
@@ -501,10 +499,10 @@ def main():
             send_formatted_email(email_payload, 'databasesol-main-ui.html')
             return
         else:
-             logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
+             logger.debug("Structural DB record exists but no verified solution — falling through to Vector DB")
 
     # vector path
-    logger.info("Checking vector DB")
+    logger.debug("Checking Vector DB for matching solutions")
     try:
         cleanErr = clean_error_description(services.masked_errordescription)
         embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
@@ -519,7 +517,7 @@ def main():
             
             # Restoration: Extract context and pass to LLM
             context_text = extract_solutions_from_points(points)
-            logger.info(f"Injecting context (len={len(context_text)}) into LLM prompt")
+            logger.debug(f"Injecting {len(context_text)} chars of context into LLM prompt")
             
             llmresponse = services.call_llm(
                 services.incoming_payload.get('code',''), 
