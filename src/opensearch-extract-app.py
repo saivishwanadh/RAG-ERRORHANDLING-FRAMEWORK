@@ -550,7 +550,8 @@ def batch_fetch_occurrence_counts(
 # ---------------------------------------------------------------------------
 
 def send_high_priority_alert(
-    app_name: str, code: str, description: str, count: int, timestamp: datetime
+    app_name: str, code: str, description: str, count: int, timestamp: datetime,
+    incident_url: str = "#", incident_display: str = "N/A"
 ):
     """Send a high-priority escalation email directly via SMTP, bypassing RabbitMQ."""
     try:
@@ -583,6 +584,8 @@ def send_high_priority_alert(
                 <td style="padding:8px;border:1px solid #ddd;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
             <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
                 <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
+            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Incident Ticket</td>
+                <td style="padding:8px;border:1px solid #ddd;"><a href="{incident_url}" style="color:#007bff;text-decoration:none;">{incident_display}</a></td></tr>
             </table>
             <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by Opssolver Engine</p>
         </div>
@@ -775,6 +778,19 @@ def process_opensearch_cycle():
                         error_key = (payload["applicationName"], payload["code"])
                         last_alert = escalation_cooldown.get(error_key)
                         cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
+
+                        # ITSM: open/escalate ServiceNow incident for high-priority burst
+                        _itsm_key = f"{payload['applicationName']}_{payload['code']}"
+                        incident_data = _incident_manager.handle_high_priority(
+                            error_key=_itsm_key,
+                            app_name=payload['applicationName'],
+                            error_code=payload['code'],
+                            description=payload['description'],
+                            count=new_db_count,
+                        )
+                        incident_display = incident_data.get("incident_display", "N/A") if incident_data else "N/A"
+                        incident_url = incident_data.get("incident_url", "#") if incident_data else "#"
+
                         if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
                             logger.warning(
                                 f"ESCALATION TRIGGERED (within-cycle): "
@@ -787,7 +803,9 @@ def process_opensearch_cycle():
                                 code=payload["code"],
                                 description=payload["description"],
                                 count=new_db_count,
-                                timestamp=error_timestamp
+                                timestamp=error_timestamp,
+                                incident_url=incident_url,
+                                incident_display=incident_display
                             )
                             escalation_cooldown[error_key] = now_utc
                         else:

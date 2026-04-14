@@ -113,6 +113,11 @@ class Config:
     SERVICENOW_INSTANCE_URL    = os.getenv("SERVICENOW_INSTANCE_URL", "")
     SERVICENOW_USERNAME        = os.getenv("SERVICENOW_USERNAME", "")
     SERVICENOW_PASSWORD        = os.getenv("SERVICENOW_PASSWORD", "")
+    # Must match a Resolution Code value allowed by your ServiceNow instance's Data Policy.
+    # Common values: "Resolved by caller", "Workaround provided", "Known error"
+    SERVICENOW_CLOSE_CODE      = os.getenv("SERVICENOW_CLOSE_CODE", "Workaround provided")
+    # Assignment group name exactly as it appears in ServiceNow (e.g. "Opssolver-Operations")
+    SERVICENOW_ASSIGNMENT_GROUP = os.getenv("SERVICENOW_ASSIGNMENT_GROUP", "")
 
     
     @classmethod

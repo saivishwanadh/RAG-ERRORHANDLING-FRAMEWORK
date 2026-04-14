@@ -468,6 +468,20 @@ def main():
             
             new_id = db_insert(llmresponse)
             
+            # ITSM: create / update incident first
+            _err_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+            incident_data = services.incidents.handle_error(
+                error_key=_err_key,
+                app_name=services.incoming_payload.get('applicationName', ''),
+                error_code=services.incoming_payload.get('code', ''),
+                description=services.incoming_payload.get('description', ''),
+                count=services.incoming_payload.get('occurrence_count', 1),
+                llm_summary=llmresponse.get('rootCause', '') or '',
+            )
+            
+            incident_display = incident_data.get("incident_display", "N/A") if incident_data else "N/A"
+            incident_url = incident_data.get("incident_url", "#") if incident_data else "#"
+
             email_payload = {
                 'serviceName': services.incoming_payload.get('applicationName'),
                 'environment': 'Non Prod',
@@ -480,20 +494,11 @@ def main():
                 'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
                 'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
                 'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
-                'confirmedSolutions': solutions
+                'confirmedSolutions': solutions,
+                'incidentDisplay': incident_display,
+                'incidentUrl': incident_url
             }
             send_formatted_email(email_payload, 'databasesol-main-ui.html')
-
-            # ITSM: create / update incident for this error (DB-verified solution path)
-            _err_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
-            services.incidents.handle_error(
-                error_key=_err_key,
-                app_name=services.incoming_payload.get('applicationName', ''),
-                error_code=services.incoming_payload.get('code', ''),
-                description=services.incoming_payload.get('description', ''),
-                count=services.incoming_payload.get('occurrence_count', 1),
-                llm_summary=llmresponse.get('rootCause', '') or '',
-            )
             return
         else:
              logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
@@ -523,6 +528,21 @@ def main():
             )
             new_id = db_insert(llmresponse)
             solutions = extract_solutions_from_points(points)
+            # ITSM: create / update incident for this error (VectorDB path)
+            error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+            llm_summary = llmresponse.get('rootCause', '') or ''
+            incident_data = services.incidents.handle_error(
+                error_key=error_key,
+                app_name=services.incoming_payload.get('applicationName', ''),
+                error_code=services.incoming_payload.get('code', ''),
+                description=services.incoming_payload.get('description', ''),
+                count=services.incoming_payload.get('occurrence_count', 1),
+                llm_summary=llm_summary,
+            )
+            
+            incident_display = incident_data.get("incident_display", "N/A") if incident_data else "N/A"
+            incident_url = incident_data.get("incident_url", "#") if incident_data else "#"
+
             email_payload = {
                 'serviceName': services.incoming_payload.get('applicationName'),
                 'environment': 'Non Prod',
@@ -535,21 +555,11 @@ def main():
                 'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
                 'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
                 'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
-                'confirmedSolutions': solutions
+                'confirmedSolutions': solutions,
+                'incidentDisplay': incident_display,
+                'incidentUrl': incident_url
             }
             send_formatted_email(email_payload, 'databasesol-main-ui.html')
-
-            # ITSM: create / update incident for this error (VectorDB path)
-            error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
-            llm_summary = llmresponse.get('rootCause', '') or ''
-            services.incidents.handle_error(
-                error_key=error_key,
-                app_name=services.incoming_payload.get('applicationName', ''),
-                error_code=services.incoming_payload.get('code', ''),
-                description=services.incoming_payload.get('description', ''),
-                count=services.incoming_payload.get('occurrence_count', 1),
-                llm_summary=llm_summary,
-            )
             return
 
     except Exception:
@@ -559,6 +569,21 @@ def main():
     logger.info('Using LLM only')
     llmresponse = services.call_llm(services.incoming_payload.get('code',''), services.masked_errordescription)
     new_id = db_insert(llmresponse)
+    # ITSM: create / update incident for this error (LLM-only path)
+    error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
+    llm_summary = llmresponse.get('rootCause', '') or ''
+    incident_data = services.incidents.handle_error(
+        error_key=error_key,
+        app_name=services.incoming_payload.get('applicationName', ''),
+        error_code=services.incoming_payload.get('code', ''),
+        description=services.incoming_payload.get('description', ''),
+        count=services.incoming_payload.get('occurrence_count', 1),
+        llm_summary=llm_summary,
+    )
+    
+    incident_display = incident_data.get("incident_display", "N/A") if incident_data else "N/A"
+    incident_url = incident_data.get("incident_url", "#") if incident_data else "#"
+
     email_payload = {
         'serviceName': services.incoming_payload.get('applicationName'),
         'environment': 'Non Prod',
@@ -570,21 +595,11 @@ def main():
         'rootCause': llmresponse.get('rootCause','N/A'),
         'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
         'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
-        'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')}
+        'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
+        'incidentDisplay': incident_display,
+        'incidentUrl': incident_url
     }
     send_formatted_email(email_payload, 'email-main-ui.html')
-
-    # ITSM: create / update incident for this error (LLM-only path)
-    error_key = f"{services.incoming_payload.get('applicationName')}_{services.incoming_payload.get('code')}"
-    llm_summary = llmresponse.get('rootCause', '') or ''
-    services.incidents.handle_error(
-        error_key=error_key,
-        app_name=services.incoming_payload.get('applicationName', ''),
-        error_code=services.incoming_payload.get('code', ''),
-        description=services.incoming_payload.get('description', ''),
-        count=services.incoming_payload.get('occurrence_count', 1),
-        llm_summary=llm_summary,
-    )
 
 
 # ---- DLQ helper ----

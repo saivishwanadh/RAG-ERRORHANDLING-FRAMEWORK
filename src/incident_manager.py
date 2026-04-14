@@ -56,6 +56,7 @@ class IncidentProvider(ABC):
     interface via IncidentManager.
     """
 
+    @abstractmethod
     def create_incident(
         self,
         title: str,
@@ -166,12 +167,17 @@ class ServiceNowProvider(IncidentProvider):
         }
         if work_notes:
             body["work_notes"] = work_notes
+        # Assign to the configured group if one is set
+        group = getattr(Config, "SERVICENOW_ASSIGNMENT_GROUP", "")
+        if group:
+            body["assignment_group"] = group
 
         result = self._post(body)
         sys_id = result.get("sys_id", "")
         number = result.get("number", "")
         logger.info(
             f"[IncidentManager] ServiceNow incident created: {number} (sys_id={sys_id})"
+            + (f", assigned to group='{group}'" if group else "")
         )
         return sys_id, number
 
@@ -187,6 +193,10 @@ class ServiceNowProvider(IncidentProvider):
             if priority == SNOW_PRIORITY_CRITICAL:
                 body["urgency"] = "1"
                 body["impact"] = "1"
+                # Re-apply assignment group on escalation so it's never lost
+                group = getattr(Config, "SERVICENOW_ASSIGNMENT_GROUP", "")
+                if group:
+                    body["assignment_group"] = group
         self._patch(incident_id, body)
         logger.info(
             f"[IncidentManager] ServiceNow incident updated: sys_id={incident_id}, "
@@ -198,10 +208,11 @@ class ServiceNowProvider(IncidentProvider):
         incident_id: str,
         resolution_notes: str,
     ) -> None:
+        close_code = getattr(Config, "SERVICENOW_CLOSE_CODE", "Workaround provided") or "Workaround provided"
         body: dict = {
-            "state": "6", # 6 = Resolved
+            "state": "6",  # 6 = Resolved
             "close_notes": resolution_notes,
-            "close_code": "Workaround provided",
+            "close_code": close_code,
         }
         self._patch(incident_id, body)
         logger.info(
@@ -361,7 +372,7 @@ class IncidentManager:
         description: str,
         count: int,
         llm_summary: str = "",
-    ) -> None:
+    ) -> Optional[dict]:
         """
         Called by the core engine (error-solution-create.py) after LLM analysis.
 
@@ -373,16 +384,15 @@ class IncidentManager:
         case4/5: existing critical ticket  -> no update (suppress spam)
         """
         if not self._ensure_ready():
-            return
+            return None
 
         desired_priority = self._map_priority(count)
         record = self._get_record(error_key)
 
         if record is None:
             # No incident yet — create one (case1, case2)
-            self._create_new(error_key, app_name, error_code, description, count,
+            return self._create_new(error_key, app_name, error_code, description, count,
                              llm_summary, desired_priority)
-            return
 
         # We have an existing record. Check if it is still active in the provider.
         if not self._provider.is_incident_active(record["incident_id"]):
@@ -392,9 +402,8 @@ class IncidentManager:
                 f"Creating new one."
             )
             self._mark_closed(error_key)
-            self._create_new(error_key, app_name, error_code, description, count,
+            return self._create_new(error_key, app_name, error_code, description, count,
                              llm_summary, desired_priority)
-            return
 
         current_priority = record.get("priority", SNOW_PRIORITY_MODERATE)
 
@@ -404,7 +413,7 @@ class IncidentManager:
                 f"[IncidentManager] Ticket {record['incident_display']} already Critical "
                 f"and active — no update sent (suppressed)."
             )
-            return
+            return self._build_return_dict(record["incident_id"], record["incident_display"])
 
         if desired_priority == SNOW_PRIORITY_CRITICAL:
             # case3: Escalate from moderate to critical
@@ -430,6 +439,8 @@ class IncidentManager:
             logger.info(
                 f"[IncidentManager] Ticket {record['incident_display']} is moderate (count={count})."
             )
+        
+        return self._build_return_dict(record["incident_id"], record["incident_display"])
 
     def handle_high_priority(
         self,
@@ -439,7 +450,7 @@ class IncidentManager:
         description: str,
         count: int,
         llm_summary: str = "",
-    ) -> None:
+    ) -> Optional[dict]:
         """
         Called by extractors when the error count crosses HIGH_PRIORITY_THRESHOLD
         within a single poll cycle (bypasses RabbitMQ — direct Critical ticket).
@@ -450,25 +461,23 @@ class IncidentManager:
         case5: subsequent run crosses threshold again -> no update if already Critical
         """
         if not self._ensure_ready():
-            return
+            return None
 
         record = self._get_record(error_key)
 
         if record is None:
             # case2: Brand-new critical burst — create straight to Critical
-            self._create_new(
+            return self._create_new(
                 error_key, app_name, error_code, description, count,
                 llm_summary, SNOW_PRIORITY_CRITICAL
             )
-            return
 
         if not self._provider.is_incident_active(record["incident_id"]):
             self._mark_closed(error_key)
-            self._create_new(
+            return self._create_new(
                 error_key, app_name, error_code, description, count,
                 llm_summary, SNOW_PRIORITY_CRITICAL
             )
-            return
 
         # Ticket exists and is active
         if record.get("priority") == SNOW_PRIORITY_CRITICAL:
@@ -477,9 +486,9 @@ class IncidentManager:
                 f"[IncidentManager] High-priority ticket {record['incident_display']} "
                 f"already Critical and active — no update sent (suppressed)."
             )
-            return
+            return self._build_return_dict(record["incident_id"], record["incident_display"])
 
-        # Existing Moderate ticket: escalate
+        # Existing Moderate ticket: escalate to Critical
         notes = (
             f"Opssolver Engine — HIGH-PRIORITY ESCALATION\n"
             f"Error '{error_code}' in '{app_name}' has surged to {count} occurrences "
@@ -498,6 +507,8 @@ class IncidentManager:
             )
         except Exception as exc:
             logger.error(f"[IncidentManager] Failed to escalate via high-priority: {exc}")
+            
+        return self._build_return_dict(record["incident_id"], record["incident_display"])
 
     def resolve_ticket(self, error_key: str, resolution_notes: str) -> None:
         """
@@ -516,7 +527,16 @@ class IncidentManager:
             
         incident_id = record["incident_id"]
         display_name = record["incident_display"]
-        
+
+        # Guard: don't try to resolve a ticket already closed in ServiceNow
+        if not self._provider.is_incident_active(incident_id):
+            logger.info(
+                f"[IncidentManager] Ticket {display_name} is already closed in ServiceNow. "
+                f"Cleaning up local record."
+            )
+            self._mark_closed(error_key)
+            return
+
         try:
             self._provider.resolve_incident(incident_id, resolution_notes)
             self._mark_closed(error_key)
@@ -535,7 +555,7 @@ class IncidentManager:
         count: int,
         llm_summary: str,
         priority: int,
-    ) -> None:
+    ) -> Optional[dict]:
         title = f"{error_code} in {app_name}"
         body = (
             f"Application: {app_name}\n"
@@ -552,8 +572,20 @@ class IncidentManager:
                 f"[IncidentManager] Created {incident_display} "
                 f"(priority={priority}) for {error_key}"
             )
+            return self._build_return_dict(incident_id, incident_display)
         except Exception as exc:
             logger.error(f"[IncidentManager] Failed to create incident: {exc}")
+            return None
+
+    def _build_return_dict(self, incident_id: str, incident_display: str) -> dict:
+        url = getattr(Config, "SERVICENOW_INSTANCE_URL", "")
+        if url:
+            url = f"{url.rstrip('/')}/nav_to.do?uri=incident.do?sys_id={incident_id}"
+        return {
+            "incident_display": incident_display,
+            "incident_url": url,
+            "incident_id": incident_id
+        }
 
     def _get_record(self, error_key: str) -> Optional[dict]:
         sql = "SELECT * FROM itsm_incidents WHERE error_key = %s LIMIT 1"

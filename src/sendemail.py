@@ -165,6 +165,8 @@ class EmailService:
             "{{SOLUTION1_INSTRUCTIONS}}": format_solution_text(solution1_text),
             "{{SOLUTION2_INSTRUCTIONS}}": format_solution_text(solution2_text),
             "{{SOLUTION3_INSTRUCTIONS}}": format_solution_text(solution3_text),
+            "{{INCIDENT_DISPLAY}}": self._escape_html(payload.get("incidentDisplay", "N/A")),
+            "{{INCIDENT_URL}}": self._escape_html(payload.get("incidentUrl", "#")),
         }
 
         for k, v in replacements.items():
@@ -199,6 +201,8 @@ class EmailService:
             "{{SOLUTION2_INSTRUCTIONS}}": format_solution_text(solution2_text),
             "{{SOLUTION3_INSTRUCTIONS}}": format_solution_text(solution3_text),
             "{{CONFIRMED_INSTRUCTIONS}}": format_confirmed_solutions(confirmed_solutions),
+            "{{INCIDENT_DISPLAY}}": self._escape_html(payload.get("incidentDisplay", "N/A")),
+            "{{INCIDENT_URL}}": self._escape_html(payload.get("incidentUrl", "#")),
         }
 
         for k, v in replacements.items():

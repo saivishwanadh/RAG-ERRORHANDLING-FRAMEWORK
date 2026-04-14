@@ -18,6 +18,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from src.structuraldb import DB
 from src.sendemail import EmailService
 from src.config import Config
+from src.incident_manager import IncidentManager
+
+# Module-level incident manager
+_incident_manager = IncidentManager()
 
 # Logging setup
 logging.basicConfig(
@@ -130,6 +134,18 @@ def send_reminder(record: dict) -> bool:
             "solution3": {"instructions": llmresponse.get("solution3", {}).get("instructions", "")},
         }
         
+        # Enrich payload with ServiceNow incident URL (if ITSM is enabled)
+        _itsm_key = f"{record['application_name']}_{record['error_code']}"
+        incident_data = _incident_manager.handle_error(
+            error_key=_itsm_key,
+            app_name=record["application_name"],
+            error_code=record["error_code"],
+            description=record["error_description"],
+            count=1,
+        )
+        email_payload["incidentDisplay"] = incident_data.get("incident_display", "N/A") if incident_data else "N/A"
+        email_payload["incidentUrl"] = incident_data.get("incident_url", "#") if incident_data else "#"
+
         # Generate email content
         html_content = service.email_service.populate_template_llm(email_payload)
         
