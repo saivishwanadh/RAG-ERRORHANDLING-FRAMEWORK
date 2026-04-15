@@ -7,6 +7,7 @@ import sys
 import time
 import datetime
 import re
+from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Callable, Tuple
 
 import pika
@@ -17,7 +18,6 @@ from src.vectordb import QdrantStore
 from src.embeddingmodel import EmbeddingGenerator
 from src.structuraldb import DB
 from src.geminicall import GeminiClient
-from src.sendemail import EmailService
 from src.maskdata import LogSanitizer
 from src.service_alert import ServiceAlertNotifier
 from src.config import Config
@@ -113,6 +113,19 @@ class CircuitBreaker:
         return False
 
 
+@dataclass
+class MessageContext:
+    """Holds all per-message state so the shared ServiceContainer is never mutated.
+
+    Each message processed by the RabbitMQ callback gets its own MessageContext,
+    eliminating the risk of message N's state leaking into message N+1.
+    """
+    incoming_payload: Dict[str, Any] = field(default_factory=dict)
+    sessionid: str = ""
+    masked_errordescription: str = ""
+    error_ts_str: str = ""
+
+
 # ---- Service container ----
 class ServiceContainer:
     def __init__(self):
@@ -129,7 +142,6 @@ class ServiceContainer:
         self.cb_db = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
         self.cb_llm = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
         self.cb_qdrant = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
-        self.cb_email = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
 
         # Service health alert notifier (shared, cooldown-aware)
         self.alert = ServiceAlertNotifier()
@@ -265,26 +277,6 @@ class ServiceContainer:
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3)
-    def send_email(self, template_name: str, payload: Dict[str, Any]):
-        if self.cb_email.is_open():
-            raise Exception("Email circuit open")
-        try:
-            svc = EmailService(template_name)
-            if template_name == "databasesol-main-ui.html":
-                html = svc.populate_template_db(payload)
-            else:
-                html = svc.populate_template_llm(payload)
-
-            subject = f"Error Notification: {payload.get('errorType')} in {payload.get('serviceName')}"
-            svc.send_email(html, subject, Config.TO_EMAIL)
-            self.cb_email.record_success()
-            return True
-        except Exception:
-            self.cb_email.record_failure()
-            logger.exception("Send email failed")
-            raise
-
-    @retry(exceptions=(Exception,), max_attempts=3)
     def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
@@ -306,46 +298,6 @@ class ServiceContainer:
                 "Qdrant/VectorDB", str(e), context="qdrant_upsert"
             )
             raise
-# ---- helpers for formatting ----
-
-def format_solution_text(solution_text: str) -> str:
-    if not solution_text:
-        return ""
-    text = solution_text.replace("\\n", "\n")
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    html_parts = []
-    in_list = False
-    for line in lines:
-        if re.match(r'^\d+\.\s+', line):
-            if not in_list:
-                html_parts.append("<ol style='margin-left: 20px; margin-top: 10px;'>")
-                in_list = True
-            content = re.sub(r'^\d+\.\s+', '', line)
-            html_parts.append(f"<li style='margin-bottom: 8px;'>{content}</li>")
-        else:
-            if in_list:
-                html_parts.append("</ol>")
-                in_list = False
-            html_parts.append(f"<p style='margin-bottom: 10px;'>{line}</p>")
-    if in_list:
-        html_parts.append("</ol>")
-    return "\n".join(html_parts)
-
-
-def format_confirmed_solutions(solutions_text: str) -> str:
-    if not solutions_text:
-        return "<p>No confirmed solutions available.</p>"
-    solution_blocks = re.split(r'Solution \d+:', solutions_text)
-    solution_blocks = [block.strip() for block in solution_blocks if block.strip()]
-    if not solution_blocks:
-        return "<p>No confirmed solutions available.</p>"
-    html_parts = []
-    for i, block in enumerate(solution_blocks, 1):
-        html_parts.append(f"<div style='margin-bottom: 15px; padding: 10px; background-color: #f0f8ff; border-left: 4px solid #007bff;'>")
-        html_parts.append(f"<h4 style='color: #007bff; margin-top: 0;'>Confirmed Solution {i}</h4>")
-        html_parts.append(format_solution_text(block))
-        html_parts.append("</div>")
-    return "\n".join(html_parts)
 
 
 # ---- core pipeline functions (use service wrappers) ----
@@ -353,13 +305,16 @@ def format_confirmed_solutions(solutions_text: str) -> str:
 services = ServiceContainer()
 
 
-def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]):
-    services.incoming_payload = payload
-    services.sanitizer = services.sanitizer or LogSanitizer()
-    services.masked_errordescription = services.sanitizer.sanitize(payload.get('description', ''))
-    logger.info(f"Masked Data: {services.masked_errordescription}")
-    services.sessionid = str(uuid.uuid4())
-    logger.info(f"Processing: App={payload.get('applicationName')} Code={payload.get('code')} Session={services.sessionid}")
+def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]) -> MessageContext:
+    """Create a fresh MessageContext for this message — no shared state mutation."""
+    ctx = MessageContext()
+    ctx.incoming_payload = payload
+    sanitizer = services.sanitizer or LogSanitizer()
+    ctx.masked_errordescription = sanitizer.sanitize(payload.get('description', ''))
+    logger.info(f"Masked Data: {ctx.masked_errordescription}")
+    ctx.sessionid = str(uuid.uuid4())
+    logger.info(f"Processing: App={payload.get('applicationName')} Code={payload.get('code')} Session={ctx.sessionid}")
+    return ctx
 
 
 def clean_error_description(text: str) -> dict:
@@ -375,8 +330,9 @@ def clean_error_description(text: str) -> dict:
 
 # safe db insert uses services.db_execute
 
-def db_insert(llmresponse: dict):
-    cleanErr = clean_error_description(services.masked_errordescription)
+def db_insert(llmresponse: dict, ctx: MessageContext) -> Optional[int]:
+    """Insert a new error+solution row; uses ctx for per-message state."""
+    cleanErr = clean_error_description(ctx.masked_errordescription)
     insert_sql = """
         INSERT INTO errorsolutiontable (
             application_name, error_code, error_description, sessionID,
@@ -384,14 +340,14 @@ def db_insert(llmresponse: dict):
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     params = (
-        services.incoming_payload.get('applicationName'),
-        services.incoming_payload.get('code'),
-        services.incoming_payload.get('description', ''),
-        services.sessionid,
+        ctx.incoming_payload.get('applicationName'),
+        ctx.incoming_payload.get('code'),
+        ctx.masked_errordescription,          # ← masked, not raw
+        ctx.sessionid,
         json.dumps(llmresponse),
-        services.error_ts_str,
+        ctx.error_ts_str,
         'active',
-        services.incoming_payload.get('occurrence_count', 1)  # Use batch-counted value from extractor
+        ctx.incoming_payload.get('occurrence_count', 1)
     )
 
     inserted_rows = services.db_execute(insert_sql, params, fetch=True)
@@ -400,10 +356,6 @@ def db_insert(llmresponse: dict):
         new_id = inserted_rows[0].get('id') if isinstance(inserted_rows[0], dict) else inserted_rows[0][0]
     else:
         new_id = None
-
-
-
-
     return new_id
 
 
@@ -423,19 +375,14 @@ def extract_solutions_from_points(points):
     return final_output.strip()
 
 
-# send formatted email wrapper
-
-def send_formatted_email(email_payload: Dict[str, Any], template_name: str):
-    try:
-        services.send_email(template_name, email_payload)
-        logger.info("Email sent")
-    except Exception:
-        logger.exception("Failed to send formatted email")
-
-
 # main processing flow with guarded calls
 
-def main():
+def main(ctx: MessageContext):
+    """Core RAG pipeline. All per-message state is read from ctx, not from services."""
+    # Null guard — should never happen if callback is correct, but belt-and-suspenders
+    if not ctx.incoming_payload:
+        raise ValueError("main() called with empty MessageContext — this is a bug in callback()")
+
     # structural DB check
     sql = """
         SELECT id, ops_solution, llm_solution
@@ -444,41 +391,17 @@ def main():
         AND application_name = %s
         LIMIT 1;
     """
-    params = (services.incoming_payload.get('description'), services.incoming_payload.get('applicationName'))
+    params = (ctx.incoming_payload.get('description'), ctx.incoming_payload.get('applicationName'))
 
     rows = services.db_execute(sql, params, fetch=True)
     if rows and len(rows) > 0:
         solutions = rows[0].get('ops_solution')
         if solutions:
             logger.info("Found verified solution in structural DB")
-            # If we have a verified solution, use it.
-            # We don't need to re-insert into DB or call LLM.
-            # Just send the email.
-            
-            # Note: We need to load the ORIGINAL LLM response to populate the template fully,
-            # or we can pass empty LLM fields if we only care about the confirmed solution.
-            # The original code re-inserted a new row for every occurrence, which is good for tracking freq.
-            
             llm_str = rows[0].get('llm_solution')
             llmresponse = json.loads(llm_str) if llm_str else {}
-            
-            new_id = db_insert(llmresponse)
-            
-            email_payload = {
-                'serviceName': services.incoming_payload.get('applicationName'),
-                'environment': 'Non Prod',
-                'timestamp': services.error_ts_str,
-                'errorType': services.incoming_payload.get('code'),
-                'errorMessage': services.incoming_payload.get('description'),
-                'errorId': str(new_id),
-                'sessionId': services.sessionid,
-                'rootCause': llmresponse.get('rootCause','N/A'),
-                'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
-                'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
-                'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
-                'confirmedSolutions': solutions
-            }
-            send_formatted_email(email_payload, 'databasesol-main-ui.html')
+            new_id = db_insert(llmresponse, ctx)
+            logger.info(f"Stored verified-solution path result in DB (id={new_id})")
             return
         else:
              logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
@@ -486,43 +409,25 @@ def main():
     # vector path
     logger.info("Checking vector DB")
     try:
-        cleanErr = clean_error_description(services.masked_errordescription)
-        embed_input = f"Error:{services.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
+        cleanErr = clean_error_description(ctx.masked_errordescription)
+        embed_input = f"Error:{ctx.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
         raw_embedding = services.embed_gen.get_embedding(embed_input)
 
-        qfilter = models.Filter(must=[models.FieldCondition(key='error_code', match=models.MatchValue(value=services.incoming_payload.get('code')))])
+        qfilter = models.Filter(must=[models.FieldCondition(key='error_code', match=models.MatchValue(value=ctx.incoming_payload.get('code')))])
         result = services.qdrant_search(collection='error_solutions', vector=raw_embedding, limit=3, query_filter=qfilter)
         points = [r for r in result if getattr(r, 'score', 0) >= 0.85]
 
         if len(points) > 0:
             logger.info(f"Found {len(points)} matching vectors")
-            
-            # Restoration: Extract context and pass to LLM
             context_text = extract_solutions_from_points(points)
             logger.info(f"Injecting context (len={len(context_text)}) into LLM prompt")
-            
             llmresponse = services.call_llm(
-                services.incoming_payload.get('code',''), 
-                services.masked_errordescription,
+                ctx.incoming_payload.get('code',''),
+                ctx.masked_errordescription,
                 context=context_text
             )
-            new_id = db_insert(llmresponse)
-            solutions = extract_solutions_from_points(points)
-            email_payload = {
-                'serviceName': services.incoming_payload.get('applicationName'),
-                'environment': 'Non Prod',
-                'timestamp': services.error_ts_str,
-                'errorType': services.incoming_payload.get('code'),
-                'errorMessage': services.incoming_payload.get('description'),
-                'errorId': str(new_id),
-                'sessionId': services.sessionid,
-                'rootCause': llmresponse.get('rootCause','N/A'),
-                'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
-                'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
-                'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')},
-                'confirmedSolutions': solutions
-            }
-            send_formatted_email(email_payload, 'databasesol-main-ui.html')
+            new_id = db_insert(llmresponse, ctx)
+            logger.info(f"Stored vector-context path result in DB (id={new_id})")
             return
 
     except Exception:
@@ -530,22 +435,9 @@ def main():
 
     # LLM only path
     logger.info('Using LLM only')
-    llmresponse = services.call_llm(services.incoming_payload.get('code',''), services.masked_errordescription)
-    new_id = db_insert(llmresponse)
-    email_payload = {
-        'serviceName': services.incoming_payload.get('applicationName'),
-        'environment': 'Non Prod',
-        'timestamp': services.error_ts_str,
-        'errorType': services.incoming_payload.get('code'),
-        'errorMessage': services.incoming_payload.get('description'),
-        'errorId': str(new_id),
-        'sessionId': services.sessionid,
-        'rootCause': llmresponse.get('rootCause','N/A'),
-        'solution1': {'instructions': llmresponse.get('solution1',{}).get('instructions','')},
-        'solution2': {'instructions': llmresponse.get('solution2',{}).get('instructions','')},
-        'solution3': {'instructions': llmresponse.get('solution3',{}).get('instructions','')}
-    }
-    send_formatted_email(email_payload, 'email-main-ui.html')
+    llmresponse = services.call_llm(ctx.incoming_payload.get('code',''), ctx.masked_errordescription)
+    new_id = db_insert(llmresponse, ctx)
+    logger.info(f"Stored LLM-only path result in DB (id={new_id})")
 
 
 # ---- DLQ helper ----
@@ -622,9 +514,13 @@ def callback(ch, method, properties, body):
         return
 
     try:
-        store_incoming_payload_and_set_uuid(payload)
+        # Build a fresh per-message context — no shared mutable state on services
+        ctx = store_incoming_payload_and_set_uuid(payload)
         epoch = payload.get('timestamp')
-        services.error_ts_str = str(datetime.datetime.fromtimestamp(epoch)) if epoch else str(datetime.datetime.now())
+        ctx.error_ts_str = (
+            str(datetime.datetime.fromtimestamp(epoch)) if epoch
+            else str(datetime.datetime.now())
+        )
 
         # If any circuit is open, fail-fast: republish with retry increment to slow things down
         if services.cb_db.is_open() or services.cb_llm.is_open() or services.cb_qdrant.is_open():
@@ -632,7 +528,7 @@ def callback(ch, method, properties, body):
             raise Exception('Downstream service circuit open')
 
         # main pipeline
-        main()
+        main(ctx)
 
         ch.basic_ack(delivery_tag=delivery_tag)
         logger.info('Message processed and acknowledged')

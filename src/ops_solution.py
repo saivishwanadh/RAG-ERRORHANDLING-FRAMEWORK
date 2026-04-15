@@ -198,15 +198,18 @@ async def update_vector(
         
     # If custom solution is not provided, fetch from LLM solution
     if custom_solution is None:
-        row = db.execute(
+        llm_rows = db.execute(
             "SELECT error_code,error_description,llm_solution FROM errorsolutiontable WHERE id=%s",
             (record_id,), fetch=True
-        )[0]
+        )
+        if not llm_rows:
+            raise HTTPException(status_code=404, detail="Record not found (deleted between checks)")
+        row = llm_rows[0]
 
         llm_solution_dict = json.loads(row["llm_solution"])
         solution_key = f"solution{selected_solution_id}"
         custom_solution = llm_solution_dict.get(solution_key, {}).get("instructions")
-        
+
     # Update DB
     db.execute(
         """UPDATE errorsolutiontable

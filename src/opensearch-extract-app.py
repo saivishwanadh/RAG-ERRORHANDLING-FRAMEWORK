@@ -21,7 +21,7 @@ from src.service_alert import ServiceAlertNotifier
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=Config.LOG_LEVEL,
+    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -40,8 +40,6 @@ scheduler: Optional[BlockingScheduler] = None
 # Persistent PostgreSQL connection — reused across all poll cycles
 _db_conn: Optional[psycopg2.extensions.connection] = None
 
-# In-memory escalation cooldown tracker: { (app_name, error_code) -> last_alert_datetime }
-escalation_cooldown: Dict[tuple, datetime] = {}
 
 # Cross-cycle async-gap cache: { (app_name, code, desc) -> (first_published_at UTC, count) }
 # Bridges the window between "published to RabbitMQ" and "consumer inserts DB record".
@@ -541,78 +539,6 @@ def batch_fetch_occurrence_counts(
         return {}   # Fail-open: treat all as new
 
 
-# ---------------------------------------------------------------------------
-# High-priority escalation (identical to email-extract-app)
-# ---------------------------------------------------------------------------
-
-def send_high_priority_alert(
-    app_name: str, code: str, description: str, count: int, timestamp: datetime
-):
-    """Send a high-priority escalation email directly via SMTP, bypassing RabbitMQ."""
-    try:
-        import smtplib
-        from email.message import EmailMessage
-
-        to_email = Config.HIGH_PRIORITY_TO_EMAIL or Config.TO_EMAIL
-        if not to_email:
-            logger.error("HIGH_PRIORITY_TO_EMAIL not configured. Cannot send escalation alert.")
-            return
-
-        html_body = f"""
-        <html><body style="font-family: Arial, sans-serif; color: #333;">
-        <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
-            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
-        </div>
-        <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
-            <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
-            in the last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes and requires immediate attention.</strong></p>
-            <table style="width:100%;border-collapse:collapse;margin-top:12px;">
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;width:30%;">Application</td>
-                <td style="padding:8px;border:1px solid #ddd;">{app_name}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Error Code</td>
-                <td style="padding:8px;border:1px solid #ddd;">{code}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Occurrences</td>
-                <td style="padding:8px;border:1px solid #ddd;color:#b0002a;font-weight:bold;">{count} times</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Time Window</td>
-                <td style="padding:8px;border:1px solid #ddd;">Last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Last Seen</td>
-                <td style="padding:8px;border:1px solid #ddd;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
-                <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
-            </table>
-            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by Opssolver Engine</p>
-        </div>
-        </body></html>
-        """
-
-        msg = EmailMessage()
-        msg["Subject"] = (
-            f"🚨 HIGH PRIORITY: {code} occurred {count}x "
-            f"in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}] (OpenSearch)"
-        )
-        msg["From"] = Config.SMTP_USERNAME
-        msg["To"] = to_email
-        msg.set_content(
-            f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. "
-            f"Check HTML version."
-        )
-        msg.add_alternative(html_body, subtype="html")
-
-        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-            s.send_message(msg)
-
-        logger.warning(
-            f"🚨 HIGH-PRIORITY ALERT SENT (OpenSearch): "
-            f"{app_name}/{code} ({count}x) → {to_email}"
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to send high-priority alert: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Main poll cycle
@@ -765,35 +691,11 @@ def process_opensearch_cycle():
                         payload["applicationName"], payload["code"],
                         payload["description"], error_timestamp
                     )
-                    now_utc = datetime.now(timezone.utc)
-                    # Bug 2 fix carried forward: check escalation for existing errors
-                    if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                        error_key = (payload["applicationName"], payload["code"])
-                        last_alert = escalation_cooldown.get(error_key)
-                        cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-                        if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                            logger.warning(
-                                f"🚨 ESCALATION TRIGGERED (within-cycle): "
-                                f"{payload['applicationName']}/{payload['code']} "
-                                f"occurred {new_db_count}x "
-                                f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                            )
-                            send_high_priority_alert(
-                                app_name=payload["applicationName"],
-                                code=payload["code"],
-                                description=payload["description"],
-                                count=new_db_count,
-                                timestamp=error_timestamp
-                            )
-                            escalation_cooldown[error_key] = now_utc
-                        else:
-                            minutes_since = (now_utc - last_alert).total_seconds() / 60
-                            logger.info(
-                                f"⏸️ Escalation cooldown active for {payload['code']} "
-                                f"({minutes_since:.1f}min ago, "
-                                f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
-                            )
-
+                    logger.info(
+                        f"📈 Incremented occurrence_count for existing error "
+                        f"{payload['applicationName']}/{payload['code']} "
+                        f"(now={new_db_count})"
+                    )
                 skipped_duplicate += 1
                 continue
 
@@ -867,69 +769,15 @@ def process_opensearch_cycle():
                     mark_doc_seen(doc_id)
                     _published_cache[cycle_key] = (now_utc, batch_count)
                     published += 1
-                    processed += 1
-                    logger.info(
-                        f"✅ Published: {payload['code']} | batch_count={batch_count} | "
-                        f"doc_id cached for dedup, payload cached for async gap"
-                    )
-                    # Escalate immediately if batch itself crosses the threshold
-                    if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                        error_key = (payload["applicationName"], payload["code"])
-                        last_alert = escalation_cooldown.get(error_key)
-                        cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-                        if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                            logger.warning(
-                                f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
-                                f"{payload['applicationName']}/{payload['code']} "
-                                f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                            )
-                            send_high_priority_alert(
-                                app_name=payload["applicationName"],
-                                code=payload["code"],
-                                description=payload["description"],
-                                count=batch_count,
-                                timestamp=error_timestamp
-                            )
-                            escalation_cooldown[error_key] = now_utc
                 else:
                     logger.error("❌ RabbitMQ channel unavailable. Will retry next cycle.")
 
-            elif count < Config.HIGH_PRIORITY_THRESHOLD:
-                # Known duplicate — skip silently
+            else:
+                # Known duplicate (DB or in-memory) — skip silently
                 logger.info(
                     f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
-                    f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                    f"(seen {count}x)"
                 )
-                skipped_duplicate += 1
-
-            else:
-                # count >= HIGH_PRIORITY_THRESHOLD — escalate!
-                error_key = (payload["applicationName"], payload["code"])
-                last_alert = escalation_cooldown.get(error_key)
-                cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-
-                if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                    logger.warning(
-                        f"🚨 ESCALATION TRIGGERED: "
-                        f"{payload['applicationName']}/{payload['code']} "
-                        f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                    )
-                    send_high_priority_alert(
-                        app_name=payload["applicationName"],
-                        code=payload["code"],
-                        description=payload["description"],
-                        count=count,
-                        timestamp=error_timestamp
-                    )
-                    escalation_cooldown[error_key] = now_utc
-                else:
-                    minutes_since = (now_utc - last_alert).total_seconds() / 60
-                    logger.info(
-                        f"⏸️ Escalation cooldown active for {payload['code']} "
-                        f"({minutes_since:.1f}min ago, "
-                        f"cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
-                    )
-
                 skipped_duplicate += 1
 
         except Exception as e:
@@ -988,9 +836,8 @@ if __name__ == "__main__":
     logger.info(
         f"🚀 Starting OpenSearch Extractor | "
         f"index={Config.OPENSEARCH_INDEX} | "
-        f"poll_interval={Config.POLL_INTERVAL_SECONDS}s | "
-        f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min | "
-        f"escalation_threshold={Config.HIGH_PRIORITY_THRESHOLD}"
+        f"interval={Config.POLL_INTERVAL_SECONDS}s | "
+        f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min"
     )
 
     # Initial connection setup at startup (fail-fast rather than silent)

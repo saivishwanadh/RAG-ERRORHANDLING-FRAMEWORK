@@ -11,12 +11,12 @@ password = "shzjkthwnrngkgnb"
 to_email = "saivishwanadh.veerlapati@prowesssoft.com"
 
 # ========== Dynamic Values ==========
-exception_id = "e11c4d92-71b820ac-6a993ee4-9f0c18d7"
-timestamp = "2026-02-18T10:50:21Z"
+exception_id = "g77c0b43-56de89fg-01hi23jk-45lm67no"
+timestamp = "2026-04-15T18:20:22Z"
 error_level = "Warn"
-msg_code = "EMS-QUEUE-DEPTH"
-error_message = "Queue depth threshold exceeded"
-error_dump = "TIBCO EMS queue ORDERS.PROCESSING exceeded configured depth limit of 5000 messages. Current depth: 7421. Broker IP 10.30.8.12. Consumer application on host 10.10.0.5 is lagging. Alert issued to messaging.support@company.com and product.owner@company.com."
+msg_code = "EMS-CONSUMER-LAG"
+error_message = "Consumer lag detected"
+error_dump = "Queue PAYMENTS.INBOUND shows lag. Producer rate: 500 msg/sec, Consumer rate: 320 msg/sec. Backlog increasing steadily. Investigate consumer performance."
 engine_name = "TIBCO BW 6.5.0"
 # ========== Email HTML Template ==========
 html_content = f"""

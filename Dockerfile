@@ -19,6 +19,11 @@ ENV PATH="/app/venv/bin:$PATH"
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the spaCy language model during image build.
+# This prevents the 400MB download on every container start/restart.
+# The model is required by Presidio's LogSanitizer (maskdata.py).
+RUN python -m spacy download en_core_web_lg
+
 # ==============================================================================
 # 2. Runner Stage: Minimal runtime image
 # ==============================================================================

@@ -20,7 +20,7 @@ from src.service_alert import ServiceAlertNotifier
 
 # Setup logging
 logging.basicConfig(
-    level=Config.LOG_LEVEL,
+    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -34,13 +34,16 @@ msal_app: Optional[msal.ConfidentialClientApplication] = None
 # Optimization 1: Persistent DB connection — reused across all cycles (no open/close per email)
 _db_conn: Optional[psycopg2.extensions.connection] = None
 
-# In-memory cooldown tracker: { (app_name, error_code) -> last_alert_datetime }
-escalation_cooldown: Dict[tuple, datetime] = {}
 
 # Cross-cycle async gap cache: { (app_name, code, desc) → (first_published_at UTC, count) }
 # Bridges the window between "published to RabbitMQ" and "consumer inserts DB record"
 # Prevents duplicate emails arriving before consumer finishes from being re-published
 _published_cache: Dict[tuple, Tuple[datetime, int]] = {}
+
+# Rolling set of email message IDs that have already been published this window.
+# Keyed by email id (Graph API message id), value is the UTC datetime when first published.
+# Entries expire after DB_DUPLICATE_WINDOW_MINUTES (same TTL as other dedup layers).
+_seen_email_ids: Dict[str, datetime] = {}
 
 # Module-level service alert notifier (shared, cooldown-aware)
 _alert_notifier: ServiceAlertNotifier = ServiceAlertNotifier()
@@ -134,6 +137,34 @@ def setup_rabbitmq_connection():
         )
         rabbitmq_connection = None
         rabbitmq_channel = None  # Ensure stale channel isn't reused
+
+
+# ---------------------------------------------------------------------------
+# Seen email-ID tracker (mirrors opensearch-extract-app _seen_doc_ids pattern)
+# ---------------------------------------------------------------------------
+
+def is_seen_email(email_id: str) -> bool:
+    """Return True if this email has already been published this window."""
+    return email_id in _seen_email_ids
+
+
+def mark_email_seen(email_id: str):
+    """Record that this email has been published."""
+    _seen_email_ids[email_id] = datetime.now(timezone.utc)
+
+
+def evict_expired_seen_email_ids():
+    """
+    Remove stale entries from _seen_email_ids.
+    Call once per cycle to prevent unbounded memory growth.
+    TTL = DB_DUPLICATE_WINDOW_MINUTES (same as the DB dedup window).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=Config.DB_DUPLICATE_WINDOW_MINUTES)
+    expired = [k for k, v in _seen_email_ids.items() if v < cutoff]
+    for k in expired:
+        del _seen_email_ids[k]
+    if expired:
+        logger.debug(f"Evicted {len(expired)} expired email IDs from seen-ID cache")
 
 
 def keep_rabbitmq_alive():
@@ -397,63 +428,6 @@ def deduplicate_emails(emails: List[Dict]) -> List[Dict]:
     
     return unique
 
-def send_high_priority_alert(app_name: str, code: str, description: str, count: int, timestamp: datetime):
-    """Send a high-priority escalation email directly via SMTP, bypassing RabbitMQ."""
-    try:
-        import smtplib
-        from email.message import EmailMessage
-
-        to_email = Config.HIGH_PRIORITY_TO_EMAIL or Config.TO_EMAIL
-        if not to_email:
-            logger.error("HIGH_PRIORITY_TO_EMAIL not configured. Cannot send escalation alert.")
-            return
-
-        html_body = f"""
-        <html><body style="font-family: Arial, sans-serif; color: #333;">
-        <div style="background:#b0002a;color:white;padding:16px;border-radius:6px 6px 0 0;">
-            <h2 style="margin:0;">🚨 HIGH-PRIORITY ERROR ALERT</h2>
-        </div>
-        <div style="border:2px solid #b0002a;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
-            <p><strong>This error has occurred <span style="color:#b0002a;font-size:1.4em;">{count}x</span>
-            in the last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes and requires immediate attention.</strong></p>
-            <table style="width:100%;border-collapse:collapse;margin-top:12px;">
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;width:30%;">Application</td>
-                <td style="padding:8px;border:1px solid #ddd;">{app_name}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Error Code</td>
-                <td style="padding:8px;border:1px solid #ddd;">{code}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Occurrences</td>
-                <td style="padding:8px;border:1px solid #ddd;color:#b0002a;font-weight:bold;">{count} times</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Time Window</td>
-                <td style="padding:8px;border:1px solid #ddd;">Last {Config.DB_DUPLICATE_WINDOW_MINUTES} minutes</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Last Seen</td>
-                <td style="padding:8px;border:1px solid #ddd;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
-            <tr><td style="background:#f4f4f4;font-weight:bold;padding:8px;border:1px solid #ddd;">Description</td>
-                <td style="padding:8px;border:1px solid #ddd;">{description[:500]}</td></tr>
-            </table>
-            <p style="margin-top:16px;color:#666;font-size:0.85em;">Sent by RAG Error Handling Framework — Escalation Engine</p>
-        </div>
-        </body></html>
-        """
-
-        msg = EmailMessage()
-        msg["Subject"] = f"🚨 HIGH PRIORITY: {code} occurred {count}x in {Config.DB_DUPLICATE_WINDOW_MINUTES}min [{app_name}]"
-        msg["From"] = Config.SMTP_USERNAME
-        msg["To"] = to_email
-        msg.set_content(f"HIGH PRIORITY: {code} for {app_name} occurred {count} times. Check HTML version.")
-        msg.add_alternative(html_body, subtype="html")
-
-        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-            s.send_message(msg)
-
-        logger.warning(f"🚨 HIGH-PRIORITY ALERT SENT: {app_name}/{code} ({count}x) → {to_email}")
-
-    except Exception as e:
-        logger.error(f"Failed to send high-priority alert: {e}")
-
 def mark_email_read(message_id: str, id_url: str, access_token: str):
     """Mark email as read in Graph API"""
     # Specifically for /users/{id}/messages/{id} endpoint
@@ -470,10 +444,16 @@ def mark_email_read(message_id: str, id_url: str, access_token: str):
 def process_email_cycle():
     """Main polling logic with metrics"""
     cycle_start = datetime.now()
+    # now_utc defined here so it is always available — used in the publish-path
+    # cache write (_published_cache) and within-cycle duplicate tracking.
+    now_utc = datetime.now(timezone.utc)
     logger.info("Starting Email Poll Cycle (Client Credentials)...")
 
-    # Optimization 5: Flush heartbeat frames to keep RabbitMQ connection alive
+    # Step 1: Flush heartbeat frames to keep RabbitMQ connection alive between cycles
     keep_rabbitmq_alive()
+
+    # Step 2: Evict expired email IDs from seen-cache (prevents unbounded memory growth)
+    evict_expired_seen_email_ids()
 
     token = get_graph_token()
     if not token:
@@ -537,6 +517,13 @@ def process_email_cycle():
         filtered_emails = []
 
         for email in emails:
+            email_id = email.get('id', '')
+
+            # Layer 0: email-ID dedup — skip if already published this window
+            if email_id and is_seen_email(email_id):
+                logger.debug(f"⏭️ Already seen email_id={email_id}; skipping.")
+                continue
+
             sender = email.get('from', {}).get('emailAddress', {}).get('address', '').lower()
             if sender == target_sender:
                 filtered_emails.append(email)
@@ -630,33 +617,6 @@ def process_email_cycle():
                             payload['description'], error_timestamp
                         )
                         now_utc = datetime.now(timezone.utc)
-                        # Bug 2 fix carried forward: check escalation for existing errors
-                        if new_db_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                            error_key = (payload['applicationName'], payload['code'])
-                            last_alert = escalation_cooldown.get(error_key)
-                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                                logger.warning(
-                                    f"🚨 ESCALATION TRIGGERED (within-cycle): "
-                                    f"{payload['applicationName']}/{payload['code']} "
-                                    f"occurred {new_db_count}x "
-                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                                )
-                                send_high_priority_alert(
-                                    app_name=payload['applicationName'],
-                                    code=payload['code'],
-                                    description=payload['description'],
-                                    count=new_db_count,
-                                    timestamp=error_timestamp
-                                )
-                                escalation_cooldown[error_key] = now_utc
-                            else:
-                                minutes_since = (now_utc - last_alert).total_seconds() / 60
-                                logger.info(
-                                    f"⏸️ Escalation cooldown active for {payload['code']} "
-                                    f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
-                                )
-
                     skipped_duplicate += 1
                     continue
 
@@ -726,66 +686,23 @@ def process_email_cycle():
                                 content_type='application/json'
                             )
                         )
+                        mark_email_seen(email.get('id', ''))
                         _published_cache[cycle_key] = (now_utc, batch_count)
                         published += 1
-                        logger.info(f"✅ Published: {payload['code']} | batch_count={batch_count} | Cached for async gap")
                         processed += 1
-                        # Escalate immediately if batch itself crosses the threshold
-                        if batch_count >= Config.HIGH_PRIORITY_THRESHOLD:
-                            error_key = (payload['applicationName'], payload['code'])
-                            last_alert = escalation_cooldown.get(error_key)
-                            cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-                            if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                                logger.warning(
-                                    f"🚨 ESCALATION TRIGGERED (batch count={batch_count}): "
-                                    f"{payload['applicationName']}/{payload['code']} "
-                                    f"(threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                                )
-                                send_high_priority_alert(
-                                    app_name=payload['applicationName'],
-                                    code=payload['code'],
-                                    description=payload['description'],
-                                    count=batch_count,
-                                    timestamp=error_timestamp
-                                )
-                                escalation_cooldown[error_key] = now_utc
+                        logger.info(
+                            f"✅ Published: {payload['code']} | batch_count={batch_count} | "
+                            f"email_id cached for dedup, payload cached for async gap"
+                        )
                     else:
-                        logger.error(f"❌ RabbitMQ unavailable. Will retry next cycle.")
+                        logger.error("❌ RabbitMQ channel unavailable. Will retry next cycle.")
 
-                elif count < Config.HIGH_PRIORITY_THRESHOLD:
+                else:
                     # Known duplicate (DB or in-memory) — skip silently
                     logger.info(
                         f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
-                        f"(seen {count}x, threshold={Config.HIGH_PRIORITY_THRESHOLD})"
+                        f"(seen {count}x)"
                     )
-                    skipped_duplicate += 1
-
-                else:
-                    # count >= HIGH_PRIORITY_THRESHOLD — escalate!
-                    error_key = (payload['applicationName'], payload['code'])
-                    last_alert = escalation_cooldown.get(error_key)
-                    cooldown_delta = timedelta(minutes=Config.ESCALATION_COOLDOWN_MINUTES)
-
-                    if last_alert is None or (now_utc - last_alert) >= cooldown_delta:
-                        logger.warning(
-                            f"🚨 ESCALATION TRIGGERED: {payload['applicationName']}/{payload['code']} "
-                            f"occurred {count}x (threshold={Config.HIGH_PRIORITY_THRESHOLD})"
-                        )
-                        send_high_priority_alert(
-                            app_name=payload['applicationName'],
-                            code=payload['code'],
-                            description=payload['description'],
-                            count=count,
-                            timestamp=error_timestamp
-                        )
-                        escalation_cooldown[error_key] = now_utc
-                    else:
-                        minutes_since = (now_utc - last_alert).total_seconds() / 60
-                        logger.info(
-                            f"⏸️ Escalation cooldown active for {payload['code']} "
-                            f"({minutes_since:.1f}min ago, cooldown={Config.ESCALATION_COOLDOWN_MINUTES}min)"
-                        )
-
                     skipped_duplicate += 1
 
             except Exception as e:
@@ -805,33 +722,66 @@ def process_email_cycle():
     )
 
 def cleanup_and_exit():
+    logger.info("🛑 Shutting down Email Extractor...")
     if scheduler and scheduler.running:
-        scheduler.shutdown()
-    if rabbitmq_connection:
-        rabbitmq_connection.close()
+        scheduler.shutdown(wait=False)  # Non-blocking — matches opensearch extractor
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        try:
+            rabbitmq_connection.close()
+        except Exception:
+            pass
     sys.exit(0)
 
 def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
     cleanup_and_exit()
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
-    # Validation
+
+    # Startup validation
     if not Config.AZURE_CLIENT_ID or not Config.AZURE_CLIENT_SECRET:
         logger.error("Missing Azure Credentials in Config.")
         sys.exit(1)
-        
-    if "your-tenant-id" in Config.AZURE_TENANT_ID:
-         logger.warning("AZURE_TENANT_ID is set to default 'your-tenant-id'. Connection may fail.")
 
-    logger.info(f"🚀 Starting Email Extractor (Service Principal) for {Config.AZURE_TARGET_EMAIL}")
-    
+    if "your-tenant-id" in Config.AZURE_TENANT_ID:
+        logger.warning("AZURE_TENANT_ID is set to default 'your-tenant-id'. Connection may fail.")
+
+    logger.info(
+        f"🚀 Starting Email Extractor | "
+        f"target={Config.AZURE_TARGET_EMAIL} | "
+        f"poll_interval={Config.EMAIL_POLL_INTERVAL}s | "
+        f"dedup_window={Config.DB_DUPLICATE_WINDOW_MINUTES}min"
+    )
+
+    # Pre-startup connection initialization (fail-fast warn, not crash — matches opensearch extractor)
+    try:
+        setup_rabbitmq_connection()
+        logger.info("✅ Initial RabbitMQ connection ready")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial RabbitMQ connection failed: {e}. Will retry per cycle.")
+
+    try:
+        get_persistent_db()
+        logger.info("✅ Initial DB connection ready")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial DB connection failed: {e}. Will retry per cycle.")
+
     scheduler = BlockingScheduler()
-    # Runs every X seconds
-    scheduler.add_job(process_email_cycle, 'interval', seconds=Config.EMAIL_POLL_INTERVAL)
-    
+    scheduler.add_job(
+        process_email_cycle,
+        'interval',
+        seconds=Config.EMAIL_POLL_INTERVAL,
+        max_instances=1,   # Prevent overlapping cycles if one runs long
+        coalesce=True      # Collapse missed executions into a single run
+    )
+
+    logger.info(
+        f"⏱️  Scheduler configured — running every {Config.EMAIL_POLL_INTERVAL}s. "
+        f"Press CTRL+C to stop."
+    )
+
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

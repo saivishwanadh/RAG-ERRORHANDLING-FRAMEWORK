@@ -13,9 +13,6 @@ class Config:
     POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
     ENVIRONMENT = os.getenv("ENVIRONMENT", "Non Prod")
     
-    # Scheduler Settings
-    REMINDER_INTERVAL_HOURS = int(os.getenv("REMINDER_INTERVAL_HOURS", "24"))
-    MAX_RETRY_COUNT = int(os.getenv("MAX_RETRY_COUNT", "3"))
     PREFETCH_COUNT = int(os.getenv("PREFETCH_COUNT", "1"))
     
     # Database
@@ -31,10 +28,6 @@ class Config:
     DLQ_ENABLED=os.getenv("DLQ_ENABLED")
     DLX_EXCHANGE=os.getenv("DLX_EXCHANGE")
     DLQ_ROUTING_KEY=os.getenv("DLQ_ROUTING_KEY")
-    # ELK (legacy — kept for backward compatibility)
-    ELK_SEARCH_URL = os.getenv("ELK_SEARCH_URL")
-    ELK_APIKEY = os.getenv("ELK_APIKEY")
-    ELK_TIMEOUT = int(os.getenv("ELK_TIMEOUT_SECONDS", "30"))
 
     # OpenSearch / Elasticsearch
     OPENSEARCH_URL      = os.getenv("OPENSEARCH_URL", "http://localhost:9200")
@@ -55,7 +48,6 @@ class Config:
     QDRANT_DEFAULT_COLLECTION = os.getenv("QDRANT_DEFAULT_COLLECTION", "error_solutions")
     # LLM / Embedding
     GEMINI_APIKEY = os.getenv("GEMINI_APIKEY")
-    GEMINI_URL = os.getenv("GEMINI_URL")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 
     # Platform / Application Context for LLM Prompts
@@ -96,10 +88,6 @@ class Config:
     # Email sender filter - only process emails from this address
     EMAIL_SENDER_FILTER = os.getenv("EMAIL_SENDER_FILTER", "veerlapatisaivishwanadh@prowesssoft.com")
 
-    # High-Priority Escalation
-    HIGH_PRIORITY_THRESHOLD = int(os.getenv("HIGH_PRIORITY_THRESHOLD", "5"))  # occurrences before escalation
-    ESCALATION_COOLDOWN_MINUTES = int(os.getenv("ESCALATION_COOLDOWN_MINUTES", "60"))  # min gap between repeat alerts
-    HIGH_PRIORITY_TO_EMAIL = os.getenv("HIGH_PRIORITY_TO_EMAIL", "")
 
     # Service Health Alerts (VectorDB / DB / Gemini / OpenSearch down)
     ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "")                          # Recipient for service-down alerts

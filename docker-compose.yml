@@ -18,7 +18,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: extractor
-    command: [ "python", "src/opensearch-extract-app.py" ]
+    command: [ "python", "src/email-extract-app.py" ]
     env_file: .env
     restart: always
     extra_hosts:
@@ -26,18 +26,8 @@ services:
     dns:
       - 8.8.8.8
 
-  scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: scheduler
-    command: [ "python", "src/remainder_scheduler.py" ]
-    env_file: .env
-    restart: always
-    dns:
-      - 8.8.8.8
-
   consumer:
+
     build:
       context: .
       dockerfile: Dockerfile
