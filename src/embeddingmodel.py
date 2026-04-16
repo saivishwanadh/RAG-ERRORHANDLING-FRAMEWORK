@@ -46,7 +46,7 @@ class EmbeddingGenerator:
              logger.warning("GEMINI_APIKEY not found for EmbeddingGenerator")
         
         # Use our custom class that supports 768 dimensions
-        logger.info(f"Initializing Custom GoogleGenAIEmbeddings with model={Config.GEMINI_EMBEDDING_MODEL} and dim=768")
+        logger.debug(f"Initializing GoogleGenAIEmbeddings model={Config.GEMINI_EMBEDDING_MODEL} dim=768")
         self.embeddings = GoogleGenAIEmbeddings(
             api_key=self.api_key,
             model=Config.GEMINI_EMBEDDING_MODEL,

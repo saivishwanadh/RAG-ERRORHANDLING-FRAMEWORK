@@ -21,12 +21,10 @@ from src.geminicall import GeminiClient
 from src.maskdata import LogSanitizer
 from src.service_alert import ServiceAlertNotifier
 from src.config import Config
+from src.logger import setup_logging, set_session_id, clear_session_id
 
 # ---- Logging ----
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper()),
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-)
+setup_logging(service_name="consumer", level=Config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # ---- Constants ----
@@ -151,10 +149,9 @@ class ServiceContainer:
         logger.info("Initializing services...")
         Config.validate()
 
-        # Embedding
         try:
             self.embed_gen = EmbeddingGenerator(api_key=Config.GEMINI_APIKEY)
-            logger.info("Embedding generator initialized")
+            logger.debug("Embedding generator initialized")
         except Exception as e:
             logger.exception("Failed to init Embedding generator")
             self.alert.notify_service_down(
@@ -165,7 +162,7 @@ class ServiceContainer:
         # Qdrant
         try:
             self.store = QdrantStore(embedding_model=self.embed_gen.embeddings)
-            logger.info("Qdrant initialized")
+            logger.debug("Qdrant initialized")
         except Exception as e:
             logger.exception("Failed to init Qdrant")
             self.alert.notify_service_down(
@@ -176,7 +173,7 @@ class ServiceContainer:
         # Gemini
         try:
             self.client = GeminiClient(api_key=Config.GEMINI_APIKEY)
-            logger.info("Gemini initialized")
+            logger.debug("Gemini initialized")
         except Exception as e:
             logger.exception("Failed to init Gemini")
             self.alert.notify_service_down(
@@ -187,7 +184,7 @@ class ServiceContainer:
         # Sanitizer
         try:
             self.sanitizer = LogSanitizer()
-            logger.info("Sanitizer initialized")
+            logger.debug("Sanitizer initialized")
         except Exception as e:
             logger.exception("Failed to init sanitizer")
             raise
@@ -196,7 +193,7 @@ class ServiceContainer:
         try:
             with DB() as db:
                 db.execute("SELECT 1", fetch=True)
-            logger.info("DB reachable")
+            logger.debug("DB reachable")
         except Exception as e:
             logger.exception("DB init failure")
             self.alert.notify_service_down(
@@ -217,7 +214,7 @@ class ServiceContainer:
         self.channel.basic_qos(prefetch_count=PREFETCH_COUNT)
         # declare passive ensures queue exists
         self.channel.queue_declare(queue=Config.QUEUE, passive=True)
-        logger.info("RabbitMQ connected")
+        logger.debug("RabbitMQ connected")
 
     # DB execute with retry and circuit breaker
     @retry(exceptions=(Exception,), max_attempts=3)
@@ -309,11 +306,13 @@ def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]) -> MessageConte
     """Create a fresh MessageContext for this message — no shared state mutation."""
     ctx = MessageContext()
     ctx.incoming_payload = payload
-    sanitizer = services.sanitizer or LogSanitizer()
-    ctx.masked_errordescription = sanitizer.sanitize(payload.get('description', ''))
-    logger.info(f"Masked Data: {ctx.masked_errordescription}")
+    if services.sanitizer is None:
+        # Sanitizer failed to initialize — raise now rather than processing unmasked PII
+        raise RuntimeError("LogSanitizer not initialized — cannot process message safely")
+    ctx.masked_errordescription = services.sanitizer.sanitize(payload.get('description', ''))
+    logger.debug(f"PII masking applied, desc_len={len(ctx.masked_errordescription)}")
     ctx.sessionid = str(uuid.uuid4())
-    logger.info(f"Processing: App={payload.get('applicationName')} Code={payload.get('code')} Session={ctx.sessionid}")
+    logger.info(f"Processing: app={payload.get('applicationName')} code={payload.get('code')} session={ctx.sessionid}")
     return ctx
 
 
@@ -336,8 +335,8 @@ def db_insert(llmresponse: dict, ctx: MessageContext) -> Optional[int]:
     insert_sql = """
         INSERT INTO errorsolutiontable (
             application_name, error_code, error_description, sessionID,
-            llm_solution, error_timestamp, sessionid_status, occurrence_count
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            llm_solution, error_timestamp, sessionid_status, occurrence_count, error_type
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     params = (
         ctx.incoming_payload.get('applicationName'),
@@ -347,11 +346,12 @@ def db_insert(llmresponse: dict, ctx: MessageContext) -> Optional[int]:
         json.dumps(llmresponse),
         ctx.error_ts_str,
         'active',
-        ctx.incoming_payload.get('occurrence_count', 1)
+        ctx.incoming_payload.get('occurrence_count', 1),
+        ctx.incoming_payload.get('error_type')  # 'technical', 'business', or None
     )
 
     inserted_rows = services.db_execute(insert_sql, params, fetch=True)
-    logger.info("Inserted structural DB row")
+    logger.debug("DB row inserted")
     if inserted_rows and len(inserted_rows) > 0:
         new_id = inserted_rows[0].get('id') if isinstance(inserted_rows[0], dict) else inserted_rows[0][0]
     else:
@@ -383,7 +383,7 @@ def main(ctx: MessageContext):
     if not ctx.incoming_payload:
         raise ValueError("main() called with empty MessageContext — this is a bug in callback()")
 
-    # structural DB check
+    logger.debug("Checking structural DB for existing solution")
     sql = """
         SELECT id, ops_solution, llm_solution
         FROM errorsolutiontable
@@ -391,7 +391,8 @@ def main(ctx: MessageContext):
         AND application_name = %s
         LIMIT 1;
     """
-    params = (ctx.incoming_payload.get('description'), ctx.incoming_payload.get('applicationName'))
+    # Use masked description for DB lookup to match how records are stored
+    params = (ctx.masked_errordescription, ctx.incoming_payload.get('applicationName'))
 
     rows = services.db_execute(sql, params, fetch=True)
     if rows and len(rows) > 0:
@@ -407,8 +408,10 @@ def main(ctx: MessageContext):
              logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
 
     # vector path
-    logger.info("Checking vector DB")
+    logger.debug("Checking vector DB")
     try:
+        if services.embed_gen is None:
+            raise RuntimeError("EmbeddingGenerator not initialized — skipping vector path")
         cleanErr = clean_error_description(ctx.masked_errordescription)
         embed_input = f"Error:{ctx.incoming_payload.get('code','')} Description:{cleanErr.get('cleanText','')}"
         raw_embedding = services.embed_gen.get_embedding(embed_input)
@@ -420,7 +423,7 @@ def main(ctx: MessageContext):
         if len(points) > 0:
             logger.info(f"Found {len(points)} matching vectors")
             context_text = extract_solutions_from_points(points)
-            logger.info(f"Injecting context (len={len(context_text)}) into LLM prompt")
+            logger.debug(f"Injecting {len(context_text)} chars of vector context into LLM")
             llmresponse = services.call_llm(
                 ctx.incoming_payload.get('code',''),
                 ctx.masked_errordescription,
@@ -492,7 +495,7 @@ def handle_retry(ch, method, properties, body: bytes, retry_count: int, error: E
 
 def callback(ch, method, properties, body):
     delivery_tag = method.delivery_tag
-    logger.info(f"Message received tag={delivery_tag}")
+    logger.debug(f"Message received tag={delivery_tag}")
 
     retry_count = 0
     if properties and getattr(properties, 'headers', None):
@@ -518,20 +521,26 @@ def callback(ch, method, properties, body):
         ctx = store_incoming_payload_and_set_uuid(payload)
         epoch = payload.get('timestamp')
         ctx.error_ts_str = (
-            str(datetime.datetime.fromtimestamp(epoch)) if epoch
-            else str(datetime.datetime.now())
+            datetime.datetime.utcfromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S') if epoch
+            else datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         )
 
-        # If any circuit is open, fail-fast: republish with retry increment to slow things down
-        if services.cb_db.is_open() or services.cb_llm.is_open() or services.cb_qdrant.is_open():
-            logger.warning('One or more circuits open; performing retry/backoff')
-            raise Exception('Downstream service circuit open')
+        # Inject session ID into logging context FIRST so every log in this message has session_id
+        _log_token = set_session_id(ctx.sessionid)
+        try:
+            logger.info(f"Processing: app={ctx.incoming_payload.get('applicationName')} code={ctx.incoming_payload.get('code')} session={ctx.sessionid}")
 
-        # main pipeline
-        main(ctx)
+            # If any circuit is open, fail-fast
+            if services.cb_db.is_open() or services.cb_llm.is_open() or services.cb_qdrant.is_open():
+                logger.warning('One or more circuits open; performing retry/backoff')
+                raise Exception('Downstream service circuit open')
 
-        ch.basic_ack(delivery_tag=delivery_tag)
-        logger.info('Message processed and acknowledged')
+            main(ctx)
+
+            ch.basic_ack(delivery_tag=delivery_tag)
+            logger.info(f"Message acked | app={ctx.incoming_payload.get('applicationName')} code={ctx.incoming_payload.get('code')}")
+        finally:
+            clear_session_id(_log_token)
 
     except Exception as e:
         logger.exception('Processing failed')

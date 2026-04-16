@@ -5,13 +5,18 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: api
-    command: [ "uvicorn", "src.ops_solution:app", "--host", "0.0.0.0", "--port", "8000" ]
+    command: [ "uvicorn", "src.ops_solution:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "uvicorn_log_config.json" ]
     ports:
       - "8000:8000"
     env_file: .env
     restart: always
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"   # Rotate when file hits 50 MB
+        max-file: "5"     # Keep 5 rotated files (250 MB max total)
 
   extractor:
     build:
@@ -22,12 +27,16 @@ services:
     env_file: .env
     restart: always
     extra_hosts:
-      - "host.docker.internal:host-gateway"   # Allows container to reach host's OpenSearch
+      - "host.docker.internal:host-gateway"
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   consumer:
-
     build:
       context: .
       dockerfile: Dockerfile
@@ -37,3 +46,9 @@ services:
     restart: always
     dns:
       - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+

@@ -11,12 +11,12 @@ password = "shzjkthwnrngkgnb"
 to_email = "saivishwanadh.veerlapati@prowesssoft.com"
 
 # ========== Dynamic Values ==========
-exception_id = "g77c0b43-56de89fg-01hi23jk-45lm67no"
-timestamp = "2026-04-15T18:20:22Z"
-error_level = "Warn"
-msg_code = "EMS-CONSUMER-LAG"
-error_message = "Consumer lag detected"
-error_dump = "Queue PAYMENTS.INBOUND shows lag. Producer rate: 500 msg/sec, Consumer rate: 320 msg/sec. Backlog increasing steadily. Investigate consumer performance."
+exception_id = "h88d1c54-67ef90gh-12ij34kl-56mn78op"
+timestamp = "2026-04-16T05:04:16Z"
+error_level = "Error"
+msg_code = "DBCONNECTION-FAILED"
+error_message = "Database connection failed"
+error_dump = "User 'svc_integration' failed authentication against LDAP server ldap://10.10.10.10:389. Invalid credentials or account locked."
 engine_name = "TIBCO BW 6.5.0"
 # ========== Email HTML Template ==========
 html_content = f"""

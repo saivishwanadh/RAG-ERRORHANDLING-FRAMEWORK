@@ -17,12 +17,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from src.config import Config
 from src.structuraldb import DB
 from src.service_alert import ServiceAlertNotifier
+from src.logger import setup_logging, set_session_id, clear_session_id
 
-# Setup logging
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Setup JSON structured logging
+setup_logging(service_name="email-extractor", level=Config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Global variables
@@ -59,7 +57,7 @@ def get_persistent_db() -> psycopg2.extensions.connection:
     try:
         if _db_conn is None or _db_conn.closed:
             _db_conn = psycopg2.connect(Config.DB_URL)
-            logger.info("✅ Persistent DB connection established")
+            logger.debug("Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
         _alert_notifier.notify_service_down(
@@ -99,7 +97,7 @@ def setup_rabbitmq_connection():
 
         if conn_alive and not channel_alive:
             # Connection alive but channel dead — just recreate channel
-            logger.info("RabbitMQ: connection alive, recreating channel...")
+            logger.debug("RabbitMQ: connection alive, recreating channel...")
             rabbitmq_channel = rabbitmq_connection.channel()
             rabbitmq_channel.exchange_declare(
                 exchange=Config.EXCHANGE,
@@ -107,11 +105,10 @@ def setup_rabbitmq_connection():
                 durable=True
             )
             rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-            logger.info("RabbitMQ channel restored")
+            logger.debug("RabbitMQ channel restored")
             return
 
-        # Full reconnect needed
-        logger.info("Establishing new RabbitMQ connection...")
+        logger.debug("Establishing new RabbitMQ connection...")
         params = pika.URLParameters(Config.RABBIT_URL)
         params.heartbeat = 120               # Heartbeat every 120s (> 60s poll interval)
         params.blocked_connection_timeout = 30
@@ -128,7 +125,7 @@ def setup_rabbitmq_connection():
             durable=True
         )
         rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-        logger.info("✅ RabbitMQ connection established (heartbeat=120s)")
+        logger.info("RabbitMQ connection established")
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
@@ -246,6 +243,8 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         if msg_code:
             error_code = msg_code
 
+        error_category = get_cell_after_label("Error Category")
+
         # Timestamp Extraction
         timestamp_str = get_cell_after_label("Timestamp UTC")
         if timestamp_str:
@@ -282,9 +281,9 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         # Fallback: use subject as description
         description = f"{subject} - (parse error)"
 
-    logger.info(
+    logger.debug(
         f"Parsed email: app={app_name}, correlationId={correlation_id}, "
-        f"code={error_code}, timestamp={email_timestamp}, desc_len={len(description)}"
+        f"code={error_code}, desc_len={len(description)}"
     )
 
     return {
@@ -293,6 +292,7 @@ def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
         "code": error_code,
         "description": description,
         "timestamp": email_timestamp,
+        "error_type": error_category.strip().lower() if error_category else None,
         "source": "email"
     }
 
@@ -335,7 +335,7 @@ def check_occurrence_count(app_name, code, desc, timestamp) -> int:
             return 0
 
         new_count = max(int(r['occurrence_count']) for r in rows)
-        logger.info(f"📈 {app_name}/{code}: occurrence_count → {new_count}")
+        logger.debug(f"{app_name}/{code}: occurrence_count={new_count}")
         return new_count
 
     except Exception as e:
@@ -444,10 +444,8 @@ def mark_email_read(message_id: str, id_url: str, access_token: str):
 def process_email_cycle():
     """Main polling logic with metrics"""
     cycle_start = datetime.now()
-    # now_utc defined here so it is always available — used in the publish-path
-    # cache write (_published_cache) and within-cycle duplicate tracking.
     now_utc = datetime.now(timezone.utc)
-    logger.info("Starting Email Poll Cycle (Client Credentials)...")
+    logger.debug("Starting email poll cycle")
 
     # Step 1: Flush heartbeat frames to keep RabbitMQ connection alive between cycles
     keep_rabbitmq_alive()
@@ -579,10 +577,8 @@ def process_email_cycle():
             for _, _, ts in parsed_batch
         ]
         prefetched_counts = batch_fetch_occurrence_counts(all_keys, all_ts)
-        logger.info(
-            f"Batch pre-fetch: {len(prefetched_counts)} known errors, "
-            f"{len(set(all_keys)) - len(prefetched_counts)} new"
-        )
+        logger.debug(f"Batch pre-fetch: {len(prefetched_counts)} known, "
+                     f"{len(set(all_keys)) - len(prefetched_counts)} new")
 
         # Within-cycle tracker: catches duplicates before consumer inserts to DB
         within_cycle_counts: Dict[tuple, int] = {}
@@ -699,8 +695,8 @@ def process_email_cycle():
 
                 else:
                     # Known duplicate (DB or in-memory) — skip silently
-                    logger.info(
-                        f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
+                    logger.debug(
+                        f"Duplicate: {payload['applicationName']}/{payload['code']} "
                         f"(seen {count}x)"
                     )
                     skipped_duplicate += 1

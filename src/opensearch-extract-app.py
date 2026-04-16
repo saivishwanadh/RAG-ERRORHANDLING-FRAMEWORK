@@ -16,14 +16,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from src.config import Config
 from src.structuraldb import DB
 from src.service_alert import ServiceAlertNotifier
+from src.logger import setup_logging
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Setup JSON structured logging
+setup_logging(service_name="opensearch-extractor", level=Config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -65,7 +61,7 @@ def get_persistent_db() -> psycopg2.extensions.connection:
     try:
         if _db_conn is None or _db_conn.closed:
             _db_conn = psycopg2.connect(Config.DB_URL)
-            logger.info("✅ Persistent DB connection established")
+            logger.debug("Persistent DB connection established")
     except Exception as e:
         logger.error(f"Failed to establish persistent DB connection: {e}")
         _alert_notifier.notify_service_down(
@@ -104,8 +100,7 @@ def setup_rabbitmq_connection():
             return  # Both healthy — nothing to do
 
         if conn_alive and not channel_alive:
-            # Connection alive but channel dead — recreate channel only
-            logger.info("RabbitMQ: connection alive, recreating channel...")
+            logger.debug("RabbitMQ: connection alive, recreating channel...")
             rabbitmq_channel = rabbitmq_connection.channel()
             rabbitmq_channel.exchange_declare(
                 exchange=Config.EXCHANGE,
@@ -113,11 +108,10 @@ def setup_rabbitmq_connection():
                 durable=True
             )
             rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-            logger.info("RabbitMQ channel restored")
+            logger.debug("RabbitMQ channel restored")
             return
 
-        # Full reconnect needed
-        logger.info("Establishing new RabbitMQ connection...")
+        logger.debug("Establishing new RabbitMQ connection...")
         params = pika.URLParameters(Config.RABBIT_URL)
         params.heartbeat = 120                  # Heartbeat > poll interval
         params.blocked_connection_timeout = 30
@@ -134,7 +128,7 @@ def setup_rabbitmq_connection():
             durable=True
         )
         rabbitmq_channel.queue_declare(queue=Config.QUEUE, durable=True)
-        logger.info("✅ RabbitMQ connection established (heartbeat=120s)")
+        logger.info("RabbitMQ connection established")
 
     except Exception as e:
         logger.error(f"Failed to connect to RabbitMQ: {e}")
@@ -475,7 +469,7 @@ def check_occurrence_count(app_name: str, code: str, desc: str, timestamp: datet
             return 0
 
         new_count = max(int(r['occurrence_count']) for r in rows)
-        logger.info(f"📈 {app_name}/{code}: occurrence_count → {new_count}")
+        logger.info(f"{app_name}/{code}: occurrence_count={new_count}")
         return new_count
 
     except Exception as e:
@@ -774,8 +768,8 @@ def process_opensearch_cycle():
 
             else:
                 # Known duplicate (DB or in-memory) — skip silently
-                logger.info(
-                    f"⏭️ Duplicate: {payload['applicationName']}/{payload['code']} "
+                logger.debug(
+                    f"Duplicate: {payload['applicationName']}/{payload['code']} "
                     f"(seen {count}x)"
                 )
                 skipped_duplicate += 1

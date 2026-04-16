@@ -13,8 +13,10 @@ from src.config import Config
 from src.embeddingmodel import EmbeddingGenerator
 from src.vectordb import QdrantStore
 from src.structuraldb import DB
+from src.logger import setup_logging, set_session_id, clear_session_id
 
-# Setup logging
+# Setup JSON structured logging
+setup_logging(service_name="api", level=Config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
@@ -27,6 +29,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+import uuid as _uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class _RequestIdMiddleware(BaseHTTPMiddleware):
+    """Injects request ID into log context for every HTTP request."""
+    async def dispatch(self, request, call_next):
+        req_id = request.headers.get("X-Request-ID") or str(_uuid.uuid4())[:8]
+        token = set_session_id(req_id)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = req_id
+            return response
+        finally:
+            clear_session_id(token)
+
+app.add_middleware(_RequestIdMiddleware)
 
 # Dependencies
 def get_db():

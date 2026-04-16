@@ -49,6 +49,7 @@ ENV PATH="/app/venv/bin:$PATH"
 # Copy application source code
 COPY src/ ./src/
 COPY UI/ ./UI/
+COPY uvicorn_log_config.json ./uvicorn_log_config.json
 
 # Chown directory to appuser (in case app needs to write logs locally, though stdout is better)
 RUN chown -R appuser:appgroup /app
