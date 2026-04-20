@@ -52,3 +52,18 @@ services:
         max-size: "50m"
         max-file: "5"
 
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"

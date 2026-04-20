@@ -313,3 +313,178 @@ async def ingest_solution(
     except Exception as e:
         logger.error(f"Ingestion failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Dashboard API Endpoints
+# ============================================================
+
+@app.get("/getsolutions")
+async def get_solutions(
+    db: DB = Depends(get_db),
+    app_name: Optional[str] = None,
+    error_type: Optional[str] = None,
+    status: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20
+):
+    """Return paginated error records with optional filters."""
+    conditions = []
+    params: list = []
+
+    if app_name:
+        conditions.append("application_name = %s")
+        params.append(app_name)
+    if error_type:
+        conditions.append("error_type = %s")
+        params.append(error_type.lower())
+    if status == "resolved":
+        conditions.append("ops_solution IS NOT NULL")
+    elif status == "unresolved":
+        conditions.append("ops_solution IS NULL")
+    if from_date:
+        conditions.append("error_timestamp >= %s")
+        params.append(from_date)
+    if to_date:
+        conditions.append("error_timestamp <= %s")
+        params.append(to_date)
+    if search:
+        conditions.append("(error_code ILIKE %s OR error_description ILIKE %s)")
+        params.extend([f"%{search}%", f"%{search}%"])
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    count_sql = f"SELECT COUNT(*) as total FROM errorsolutiontable {where_clause}"
+    count_rows = db.execute(count_sql, tuple(params), fetch=True)
+    total = count_rows[0]["total"] if count_rows else 0
+
+    offset = (page - 1) * page_size
+    data_sql = f"""
+        SELECT id, application_name, error_code, error_type,
+               error_description, error_timestamp, occurrence_count,
+               sessionid_status,
+               CASE WHEN ops_solution IS NULL THEN false ELSE true END as is_resolved,
+               ops_solution, llm_solution, sessionid
+        FROM errorsolutiontable
+        {where_clause}
+        ORDER BY error_timestamp DESC
+        LIMIT %s OFFSET %s
+    """
+    rows = db.execute(data_sql, tuple(params) + (page_size, offset), fetch=True)
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+        "records": rows or []
+    }
+
+
+@app.get("/stats/summary")
+async def stats_summary(
+    from_date: Optional[str] = None,
+    to_date:   Optional[str] = None,
+    db: DB = Depends(get_db)
+):
+    """Overall error counts, optionally filtered by date range."""
+    conditions = []
+    params: list = []
+    if from_date:
+        conditions.append("error_timestamp >= %s")
+        params.append(from_date)
+    if to_date:
+        conditions.append("error_timestamp <= %s")
+        params.append(to_date)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    rows = db.execute(f"""
+        SELECT
+            COUNT(*)                                                     AS total,
+            COUNT(*) FILTER (WHERE ops_solution IS NOT NULL)             AS resolved,
+            COUNT(*) FILTER (WHERE ops_solution IS NULL)                 AS unresolved,
+            COUNT(*) FILTER (WHERE error_type = 'technical')             AS technical,
+            COUNT(*) FILTER (WHERE error_type = 'business')              AS business,
+            COUNT(*) FILTER (WHERE error_type = 'platform')              AS platform,
+            COUNT(*) FILTER (WHERE error_timestamp::date = CURRENT_DATE) AS today
+        FROM errorsolutiontable
+        {where}
+    """, tuple(params), fetch=True)
+
+    row = rows[0] if rows else {}
+    return {
+        "total":      row.get("total", 0),
+        "resolved":   row.get("resolved", 0),
+        "unresolved": row.get("unresolved", 0),
+        "technical":  row.get("technical", 0),
+        "business":   row.get("business", 0),
+        "platform":   row.get("platform", 0),
+        "today":      row.get("today", 0),
+    }
+
+
+@app.get("/stats/by-application")
+async def stats_by_application(
+    from_date: Optional[str] = None,
+    to_date:   Optional[str] = None,
+    db: DB = Depends(get_db)
+):
+    """Error counts grouped by application, optionally filtered by date range."""
+    conditions = ["application_name IS NOT NULL"]
+    params: list = []
+    if from_date:
+        conditions.append("error_timestamp >= %s")
+        params.append(from_date)
+    if to_date:
+        conditions.append("error_timestamp <= %s")
+        params.append(to_date)
+    where = "WHERE " + " AND ".join(conditions)
+
+    rows = db.execute(f"""
+        SELECT
+            application_name,
+            COUNT(*)                                             AS total,
+            COUNT(*) FILTER (WHERE ops_solution IS NOT NULL)     AS resolved,
+            COUNT(*) FILTER (WHERE ops_solution IS NULL)         AS unresolved
+        FROM errorsolutiontable
+        {where}
+        GROUP BY application_name
+        ORDER BY total DESC
+        LIMIT 20
+    """, tuple(params), fetch=True)
+    return {"data": rows or []}
+
+
+@app.get("/stats/trends")
+async def stats_trends(days: int = 7, db: DB = Depends(get_db)):
+    """Daily error counts for the last N days for the line chart."""
+    if days not in (7, 14, 30):
+        days = 7
+    rows = db.execute("""
+        SELECT
+            error_timestamp::date                                    AS day,
+            COUNT(*)                                                 AS total,
+            COUNT(*) FILTER (WHERE error_type = 'technical')        AS technical,
+            COUNT(*) FILTER (WHERE error_type = 'business')         AS business,
+            COUNT(*) FILTER (WHERE error_type = 'platform')         AS platform
+        FROM errorsolutiontable
+        WHERE error_timestamp >= CURRENT_DATE - INTERVAL '%s days'
+        GROUP BY error_timestamp::date
+        ORDER BY day ASC
+    """, (days,), fetch=True)
+    return {"days": days, "data": rows or []}
+
+
+@app.get("/applications")
+async def get_applications(db: DB = Depends(get_db)):
+    """Distinct application names for the filter dropdown."""
+    rows = db.execute("""
+        SELECT DISTINCT application_name
+        FROM errorsolutiontable
+        WHERE application_name IS NOT NULL
+        ORDER BY application_name
+    """, fetch=True)
+    return {"applications": [row["application_name"] for row in rows] if rows else []}
