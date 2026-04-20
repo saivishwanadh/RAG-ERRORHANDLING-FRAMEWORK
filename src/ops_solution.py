@@ -406,9 +406,9 @@ async def stats_summary(
             COUNT(*)                                                     AS total,
             COUNT(*) FILTER (WHERE ops_solution IS NOT NULL)             AS resolved,
             COUNT(*) FILTER (WHERE ops_solution IS NULL)                 AS unresolved,
-            COUNT(*) FILTER (WHERE error_type = 'technical')             AS technical,
-            COUNT(*) FILTER (WHERE error_type = 'business')              AS business,
-            COUNT(*) FILTER (WHERE error_type = 'platform')              AS platform,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'technical')     AS technical,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'business')      AS business,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'platform')      AS platform,
             COUNT(*) FILTER (WHERE error_timestamp::date = CURRENT_DATE) AS today
         FROM errorsolutiontable
         {where}
@@ -446,9 +446,14 @@ async def stats_by_application(
     rows = db.execute(f"""
         SELECT
             application_name,
-            COUNT(*)                                             AS total,
-            COUNT(*) FILTER (WHERE ops_solution IS NOT NULL)     AS resolved,
-            COUNT(*) FILTER (WHERE ops_solution IS NULL)         AS unresolved
+            COUNT(*)                                                                AS total,
+            COUNT(*) FILTER (WHERE ops_solution IS NOT NULL)                        AS resolved,
+            COUNT(*) FILTER (WHERE ops_solution IS NULL)                            AS unresolved,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'business')                 AS business,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'platform')                 AS platform,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'technical')                AS technical,
+            COUNT(*) FILTER (WHERE LOWER(error_type) NOT IN ('business','platform','technical')
+                              OR error_type IS NULL)                                AS unknown
         FROM errorsolutiontable
         {where}
         GROUP BY application_name
@@ -459,23 +464,71 @@ async def stats_by_application(
 
 
 @app.get("/stats/trends")
-async def stats_trends(days: int = 7, db: DB = Depends(get_db)):
-    """Daily error counts for the last N days for the line chart."""
-    if days not in (7, 14, 30):
-        days = 7
-    rows = db.execute("""
+async def stats_trends(
+    from_date:        Optional[str] = None,
+    to_date:          Optional[str] = None,
+    application_name: Optional[str] = None,
+    db: DB = Depends(get_db)
+):
+    """
+    Daily (or hourly) error counts for the trend line chart.
+    Filters by optional date range and/or application name.
+    Auto-selects hourly granularity when range <= 3 days.
+    """
+    conditions: list[str] = []
+    params: list = []
+
+    if from_date:
+        conditions.append("error_timestamp >= %s")
+        params.append(from_date)
+    if to_date:
+        conditions.append("error_timestamp <= %s")
+        params.append(to_date)
+    if application_name:
+        conditions.append("application_name = %s")
+        params.append(application_name)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # Auto-select granularity: hourly for short ranges, daily otherwise
+    use_hourly = False
+    if from_date and to_date:
+        try:
+            from datetime import date
+            d1 = date.fromisoformat(from_date[:10])
+            d2 = date.fromisoformat(to_date[:10])
+            use_hourly = (d2 - d1).days <= 3
+        except Exception:
+            pass
+
+    if use_hourly:
+        bucket       = "date_trunc('hour', error_timestamp)"
+        bucket_alias = "bucket"
+    else:
+        bucket       = "error_timestamp::date"
+        bucket_alias = "bucket"
+
+    rows = db.execute(f"""
         SELECT
-            error_timestamp::date                                    AS day,
-            COUNT(*)                                                 AS total,
-            COUNT(*) FILTER (WHERE error_type = 'technical')        AS technical,
-            COUNT(*) FILTER (WHERE error_type = 'business')         AS business,
-            COUNT(*) FILTER (WHERE error_type = 'platform')         AS platform
+            {bucket}                                                               AS bucket,
+            COUNT(*)                                                               AS total,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'technical')               AS technical,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'business')                AS business,
+            COUNT(*) FILTER (WHERE LOWER(error_type) = 'platform')                AS platform,
+            COUNT(*) FILTER (WHERE LOWER(error_type) NOT IN ('business','platform','technical')
+                              OR error_type IS NULL)                               AS unknown
         FROM errorsolutiontable
-        WHERE error_timestamp >= CURRENT_DATE - INTERVAL '%s days'
-        GROUP BY error_timestamp::date
-        ORDER BY day ASC
-    """, (days,), fetch=True)
-    return {"days": days, "data": rows or []}
+        {where}
+        GROUP BY {bucket}
+        ORDER BY {bucket_alias} ASC
+    """, tuple(params), fetch=True)
+
+    return {
+        "granularity": "hourly" if use_hourly else "daily",
+        "data": [
+            {**row, "bucket": str(row["bucket"])} for row in (rows or [])
+        ]
+    }
 
 
 @app.get("/applications")
