@@ -60,12 +60,12 @@ export async function getByApplication(dateRange = {}) {
 }
 
 /**
- * GET /stats/trends?days=7
- * @param {7|14|30} days
- * Returns: { days, data: [{ day, total, technical, business }] }
+ * GET /stats/trends
+ * @param {{ from_date?: string, to_date?: string, application_name?: string }} [filters]
+ * Returns: { granularity, data: [{ bucket, total, technical, business, platform, unknown }] }
  */
-export async function getTrends(days = 7) {
-    return request(`/stats/trends${buildQuery({ days })}`);
+export async function getTrends(filters = {}) {
+    return request(`/stats/trends${buildQuery(filters)}`);
 }
 
 // ── Records ────────────────────────────────────────────────────────────────

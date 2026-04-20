@@ -8,6 +8,7 @@ import { format } from 'date-fns';
 import Overview from './pages/Overview';
 import Records from './pages/Records';
 import KnowledgeBase from './pages/KnowledgeBase';
+import Trends from './pages/Trends';
 
 // ── Icons (inline SVG to avoid extra dependencies) ──────────────────────────
 const IconOverview = () => (
@@ -29,8 +30,12 @@ const IconKB = () => (
     <path d="M2 17l10 5 10-5" /><path d="M2 12l10 5 10-5" />
   </svg>
 );
+const IconTrend = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+  </svg>
+);
 
-// ── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar() {
   return (
     <aside className="sidebar">
@@ -50,6 +55,9 @@ function Sidebar() {
         </NavLink>
         <NavLink to="/records" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <IconRecords /> Error Records
+        </NavLink>
+        <NavLink to="/trends" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <IconTrend /> Error Trends
         </NavLink>
         <NavLink to="/knowledge-base" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <IconKB /> Knowledge Base
@@ -117,6 +125,15 @@ export default function App() {
                 <>
                   <Topbar lastUpdated={lastUpdated} />
                   <KnowledgeBase onLastUpdated={handleLastUpdated} />
+                </>
+              }
+            />
+            <Route
+              path="/trends"
+              element={
+                <>
+                  <Topbar lastUpdated={lastUpdated} />
+                  <Trends onLastUpdated={handleLastUpdated} />
                 </>
               }
             />
