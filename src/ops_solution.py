@@ -370,7 +370,7 @@ async def get_solutions(
                ops_solution, llm_solution, sessionid
         FROM errorsolutiontable
         {where_clause}
-        ORDER BY error_timestamp DESC
+        ORDER BY error_timestamp DESC, id DESC
         LIMIT %s OFFSET %s
     """
     rows = db.execute(data_sql, tuple(params) + (page_size, offset), fetch=True)

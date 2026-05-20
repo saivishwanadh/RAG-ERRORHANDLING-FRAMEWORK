@@ -1,111 +1,176 @@
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
 
-# ========== CONFIG ==========
+# ============================================================
+# SMTP CONFIG
+# ============================================================
 smtp_server = "smtp.office365.com"
-smtp_port = 587
-username = "fahad.alikhan@prowesssoft.com"
-password = "shzjkthwnrngkgnb"
-to_email = "saivishwanadh.veerlapati@prowesssoft.com"
+smtp_port   = 587
+username    = "fahad.alikhan@prowesssoft.com"
+password    = "shzjkthwnrngkgnb"
+to_email    = "saivishwanadh.veerlapati@prowesssoft.com"
 
-# ========== Dynamic Values ==========
-exception_id = "h88d1c54-67ef90gh-12ij34kl-56mn78op"
-timestamp = "2026-04-16T05:04:16Z"
-error_level = "Error"
-msg_code = "DBCONNECTION-FAILED"
-error_message = "Database connection failed"
-error_dump = "User 'svc_integration' failed authentication against LDAP server ldap://10.10.10.10:389. Invalid credentials or account locked."
-engine_name = "TIBCO BW 6.5.0"
-# ========== Email HTML Template ==========
-html_content = f"""
+
+EXCEPTIONID     = "ef9c5a76-8ccd1234-77bb88aa-9900dd11"
+ERRORCATEGORY   = "Business"
+ERRORTYPE       = "Transformation"
+ERRORCODE       = "XMLSchemaValidationFailed"
+ERRORLEVEL      = "High"
+TIMESTAMPUTC    = "2026-05-12T16:08:37Z"
+
+DOMAIN          = "SAP_ESB_PRD"
+DEPLOYMENT      = "Toyota-JP_STD"
+PROJECTNAME     = "Toyota-JP_STD_root"
+ENGINENAME      = "Toyota-JP_STD-LB-esbp14"
+
+DOCUMENTID       = "ef9c5a75-8ccd1234-33ee44ff-77665544"
+DOCUMENTNAME     = "TOY778DELIVERY-260512094256-12344321123.XML"
+DOCUMENTCATEGORY = "Delivery"
+
+MSGCODE      = "XSDValidationError"
+PROCESSSTACK = "XMLValidation/Common/Process/ValidateSchema.process>SchemaValidation"
+MSG          = (
+    "Element 'DeliveryDate' contains invalid value format. "
+    "Expected format=YYYY-MM-DD, "
+    "Received format=12/05/2026, "
+    "DocumentType=Delivery_I-301-09"
+)
+ERRORDUMP    = ""   # Leave blank or add a stack trace
+
+# ============================================================
+# HTML TEMPLATE  — matches exact TIBCO email structure
+# ============================================================
+html_content = f"""\
 <html>
 <head>
 <style>
-body {{
-    font-family: Arial, sans-serif;
-}}
+  body {{ font-family: Arial, sans-serif; font-size: 13px; }}
+  h2   {{ color: #333; }}
 
-.section-title {{
-    background-color: #b0002a;
-    color: white;
-    padding: 8px;
-    font-weight: bold;
-}}
+  .section-title {{
+      background-color: #8b0000;
+      color: white;
+      padding: 6px 10px;
+      font-weight: bold;
+      font-size: 13px;
+      text-align: center;
+  }}
 
-table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-bottom: 20px;
-}}
+  table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 0;
+  }}
 
-td {{
-    border: 1px solid #dddddd;
-    padding: 8px;
-}}
+  td {{
+      border: 1px solid #ccc;
+      padding: 5px 8px;
+      vertical-align: top;
+  }}
 
-.label {{
-    background-color: #f4f4f4;
-    font-weight: bold;
-    width: 25%;
-}}
+  .label {{
+      background-color: #f4d0d0;
+      font-weight: bold;
+      width: 18%;
+      white-space: nowrap;
+  }}
 
+  a {{ color: #0563C1; }}
 </style>
 </head>
 <body>
 
-<h2>Error Notification</h2>
-
+<!-- ═══════════════════ HEADER ═══════════════════ -->
 <div class="section-title">HEADER</div>
 <table>
-<tr><td class="label">Exception ID</td><td>{exception_id}</td>
-<td class="label">Domain</td><td>GDC_ESB21_UAT</td></tr>
-
-<tr><td class="label">Error Category</td><td>Technical</td>
-<td class="label">Deployment</td><td>Aboutyou-Shared-EMEA</td></tr>
-
-<tr><td class="label">Error Level</td><td>{error_level}</td>
-<td class="label">Project Name</td><td>Aboutyou-Shared-EMEA_root</td></tr>
-
-<tr><td class="label">Timestamp UTC</td><td>{timestamp}</td>
-<td class="label">Engine Name</td><td>{engine_name}</td></tr>
+  <tr>
+    <td class="label">EXCEPTIONID</td>  <td>{EXCEPTIONID}</td>
+    <td class="label">DOMAIN</td>       <td>{DOMAIN}</td>
+  </tr>
+  <tr>
+    <td class="label">ERRORCATEGORY</td><td>{ERRORCATEGORY}</td>
+    <td class="label">DEPLOYMENT</td>   <td>{DEPLOYMENT}</td>
+  </tr>
+  <tr>
+    <td class="label">ERRORTYPE</td>    <td>{ERRORTYPE}</td>
+    <td class="label">PROJECTNAME</td>  <td>{PROJECTNAME}</td>
+  </tr>
+  <tr>
+    <td class="label">ERRORCODE</td>    <td>{ERRORCODE}</td>
+    <td class="label">ENGINENAME</td>   <td>{ENGINENAME}</td>
+  </tr>
+  <tr>
+    <td class="label">ERRORLEVEL</td>   <td>{ERRORLEVEL}</td>
+    <td></td><td></td>
+  </tr>
+  <tr>
+    <td class="label">TIMESTAMPUTC</td> <td>{TIMESTAMPUTC}</td>
+    <td></td><td></td>
+  </tr>
 </table>
 
+<!-- ═══════════════════ DOCUMENT DETAILS ═══════════════════ -->
 <div class="section-title">DOCUMENT DETAILS</div>
 <table>
-<tr><td class="label">Document ID</td><td>NA</td></tr>
+  <tr>
+    <td class="label">DOCUMENTID</td>
+    <td><a href="#">{DOCUMENTID}</a></td>
+  </tr>
+  <tr>
+    <td class="label">DOCUMENTNAME</td>
+    <td>{DOCUMENTNAME}</td>
+  </tr>
+  <tr>
+    <td class="label">DOCUMENTCATEGORY</td>
+    <td>{DOCUMENTCATEGORY}</td>
+  </tr>
 </table>
 
+<!-- ═══════════════════ ERROR DETAILS ═══════════════════ -->
 <div class="section-title">ERROR DETAILS</div>
 <table>
-<tr><td class="label">Message Code</td><td>{msg_code}</td></tr>
-<tr><td class="label">Message</td><td>{error_message}</td></tr>
+  <tr>
+    <td class="label">MSGCODE</td>
+    <td>{MSGCODE}</td>
+  </tr>
+  <tr>
+    <td class="label">PROCESSSTACK</td>
+    <td>{PROCESSSTACK}</td>
+  </tr>
+  <tr>
+    <td class="label">MSG</td>
+    <td>{MSG}</td>
+  </tr>
 </table>
 
+<!-- ═══════════════════ ERROR DUMP ═══════════════════ -->
 <div class="section-title">ERROR DUMP</div>
 <table>
-<tr><td>{error_dump}</td></tr>
+  <tr>
+    <td class="label">ERRORDUMP</td>
+    <td>{ERRORDUMP if ERRORDUMP else "&nbsp;"}</td>
+  </tr>
 </table>
 
 </body>
 </html>
 """
 
-
-# ========== Create Email ==========
+# ============================================================
+# SEND
+# ============================================================
 msg = MIMEMultipart("alternative")
-msg["From"] = username
-msg["To"] = to_email
-msg["Subject"] = "UAT Error Notification"
+msg["From"]    = username
+msg["To"]      = to_email
+msg["Subject"] = f"TIBCO Error Notification - {ERRORCODE}"
 
 msg.attach(MIMEText(html_content, "html"))
 
-# ========== Send ==========
 server = smtplib.SMTP(smtp_server, smtp_port)
 server.starttls()
 server.login(username, password)
 server.sendmail(username, to_email, msg.as_string())
 server.quit()
 
-print("Email sent successfully!")
+print(f"✅ Email sent successfully! [{ERRORCODE}] → {to_email}")

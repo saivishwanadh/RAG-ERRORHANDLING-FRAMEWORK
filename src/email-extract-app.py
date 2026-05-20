@@ -204,81 +204,80 @@ def get_graph_token() -> Optional[str]:
 def parse_tibco_email(body: str, subject: str) -> Dict[str, Any]:
     """
     Parse TIBCO HTML alert email body.
-    
-    Extracts:
-      - applicationName  <- 'Project Name' cell
-      - correlationId    <- 'Exception ID' cell
-      - code             <- 'Message Code' cell
-      - description      <- 'Message' + 'ERROR DUMP' sections combined
+
+    Field mapping (TIBCO label → output field):
+      - applicationName  <- ENGINENAME
+      - correlationId    <- EXCEPTIONID
+      - timestamp        <- TIMESTAMPUTC
+      - code             <- ERRORCODE
+      - description      <- PROCESSSTACK + MSG + ERRORDUMP (formatted)
+      - error_type       <- ERRORCATEGORY
     """
     # Defaults
     app_name = "TIBCO_APP"
     correlation_id = "UNKNOWN"
     error_code = "UNKNOWN_ERROR"
     description = subject or "No description"
+    error_category = ""
+    email_timestamp = datetime.now(timezone.utc).timestamp()
 
     try:
         soup = BeautifulSoup(body, "lxml")
 
         def get_cell_after_label(label_text: str) -> str:
-            """Find a <td> with label text and return the next sibling <td> value."""
+            """Find a <td> whose text matches label_text (case-insensitive) and return the next sibling <td>."""
             for td in soup.find_all("td"):
                 if td.get_text(strip=True).lower() == label_text.lower():
-                    # Value is the next <td> sibling
                     next_td = td.find_next_sibling("td")
                     if next_td:
                         return next_td.get_text(strip=True)
             return ""
 
-        # --- Extract fields from HTML tables ---
-        project_name = get_cell_after_label("Project Name")
-        if project_name:
-            app_name = project_name
+        # --- applicationName ← ENGINENAME ---
+        engine_name = get_cell_after_label("ENGINENAME")
+        if engine_name:
+            app_name = engine_name
 
-        exception_id = get_cell_after_label("Exception ID")
+        # --- correlationId ← EXCEPTIONID ---
+        exception_id = get_cell_after_label("EXCEPTIONID")
         if exception_id:
             correlation_id = exception_id
 
-        msg_code = get_cell_after_label("Message Code")
-        if msg_code:
-            error_code = msg_code
-
-        error_category = get_cell_after_label("Error Category")
-
-        # Timestamp Extraction
-        timestamp_str = get_cell_after_label("Timestamp UTC")
+        # --- timestamp ← TIMESTAMPUTC ---
+        timestamp_str = get_cell_after_label("TIMESTAMPUTC")
         if timestamp_str:
             try:
-                # Parse ISO format e.g. 2026-02-18T05:16:35Z
                 dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
                 email_timestamp = dt.timestamp()
             except ValueError:
                 logger.warning(f"Failed to parse timestamp '{timestamp_str}', using current time")
-                email_timestamp = datetime.now(timezone.utc).timestamp()
-        else:
-            email_timestamp = datetime.now(timezone.utc).timestamp()
 
-        # --- Build description: Message + ERROR DUMP ---
-        message_text = get_cell_after_label("Message")
+        # --- code ← ERRORCODE ---
+        error_code_raw = get_cell_after_label("ERRORCODE")
+        if error_code_raw:
+            error_code = error_code_raw
 
-        # ERROR DUMP is in its own table section - find the div with that title
-        error_dump_text = ""
-        for div in soup.find_all("div", class_="section-title"):
-            if "ERROR DUMP" in div.get_text(strip=True).upper():
-                # The next table after this div contains the dump
-                next_table = div.find_next_sibling("table")
-                if next_table:
-                    error_dump_text = next_table.get_text(separator=" ", strip=True)
-                break
+        # --- error_type ← ERRORCATEGORY ---
+        error_category = get_cell_after_label("ERRORCATEGORY")
 
-        # Combine Message + ERROR DUMP
-        parts = [p for p in [message_text, error_dump_text] if p]
-        if parts:
-            description = " | ERROR DUMP: ".join(parts) if error_dump_text else message_text
+        # --- description ← PROCESSSTACK + MSG + ERRORDUMP ---
+        process_stack = get_cell_after_label("PROCESSSTACK")
+        msg = get_cell_after_label("MSG")
+        error_dump = get_cell_after_label("ERRORDUMP")
+
+        desc_parts = []
+        if process_stack:
+            desc_parts.append(f'PROCESSSTACK: "{process_stack}"')
+        if msg:
+            desc_parts.append(f'MSG: "{msg}"')
+        if error_dump:
+            desc_parts.append(f'ERRORDUMP: "{error_dump}"')
+
+        if desc_parts:
+            description = " | ".join(desc_parts)
 
     except Exception as e:
         logger.error(f"Error parsing HTML email body: {e}")
-        # Fallback: use subject as description
         description = f"{subject} - (parse error)"
 
     logger.debug(
@@ -397,9 +396,41 @@ def batch_fetch_occurrence_counts(
         return result
 
     except Exception as e:
-        logger.error(f"Batch fetch occurrence counts failed: {e}")
+        # Cloud DBs (e.g. Neon) silently kill idle connections — _db_conn.closed won't
+        # detect this. Force-reconnect and retry ONCE before failing open so that stale
+        # connections don't cause all emails to be wrongly treated as new.
+        logger.warning(f"Batch fetch failed (likely stale connection): {e}. Reconnecting and retrying...")
         _db_conn = None
-        return {}  # Fail open — all emails treated as new
+        try:
+            conn = get_persistent_db()
+            min_ts = min(local_timestamps)
+            unique_pairs = list({(k[0], k[1]) for k in error_keys})
+            placeholders = ','.join(['(%s,%s)'] * len(unique_pairs))
+            pair_params: List = []
+            for pair in unique_pairs:
+                pair_params.extend(pair)
+            sql = f"""
+                SELECT application_name, error_code, error_description, occurrence_count
+                  FROM errorsolutiontable
+                 WHERE (application_name, error_code) IN ({placeholders})
+                   AND error_timestamp >= %s - INTERVAL '{Config.DB_DUPLICATE_WINDOW_MINUTES} minutes'
+                 ORDER BY error_timestamp DESC
+            """
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, pair_params + [min_ts])
+                rows = cur.fetchall()
+            conn.commit()
+            result: Dict[Tuple[str, str, str], int] = {}
+            for row in rows:
+                key = (row['application_name'], row['error_code'], row['error_description'])
+                if key not in result:
+                    result[key] = int(row['occurrence_count'] or 1)
+            logger.info(f"Batch pre-fetch retry succeeded: found {len(result)}/{len(error_keys)} errors in DB")
+            return result
+        except Exception as retry_e:
+            logger.error(f"Batch fetch retry also failed: {retry_e}. Failing open.")
+            _db_conn = None
+            return {}  # Fail open — all emails treated as new
 
 
 def deduplicate_emails(emails: List[Dict]) -> List[Dict]:

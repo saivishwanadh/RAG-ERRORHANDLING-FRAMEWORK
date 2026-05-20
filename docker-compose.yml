@@ -1,10 +1,10 @@
 services:
 
-  api:
+  api1:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: api
+    container_name: api1
     command: [ "uvicorn", "src.ops_solution:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "uvicorn_log_config.json" ]
     ports:
       - "8000:8000"
@@ -15,15 +15,15 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "50m"   # Rotate when file hits 50 MB
-        max-file: "5"     # Keep 5 rotated files (250 MB max total)
+        max-size: "50m" # Rotate when file hits 50 MB
+        max-file: "5" # Keep 5 rotated files (250 MB max total)
 
   extractor:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: extractor
-    command: [ "python", "src/email-extract-app.py" ]
+    command: [ "python", "src/db-extract-app.py" ]
     env_file: .env
     restart: always
     extra_hosts:
@@ -60,7 +60,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      - api1
     restart: always
     logging:
       driver: "json-file"

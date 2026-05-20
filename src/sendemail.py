@@ -179,11 +179,7 @@ class EmailService:
         with open(self.template_path, "r", encoding="utf-8") as f:
             tpl = f.read()
 
-        # Extract and format solution instructions
-        solution1_text = payload.get("solution1", {}).get("instructions", "")
-        solution2_text = payload.get("solution2", {}).get("instructions", "")
-        solution3_text = payload.get("solution3", {}).get("instructions", "")
-        root_cause = payload.get("rootCause", "")
+        # Extract confirmed solutions from knowledge base / vector DB
         confirmed_solutions = payload.get("confirmedSolutions", "")
 
         replacements = {
@@ -194,10 +190,6 @@ class EmailService:
             "{{ERROR_MESSAGE}}": self._escape_html(payload.get("errorMessage")),
             "{{ERROR_ID}}": self._escape_html(payload.get("errorId")),
             "{{SESSION_ID}}": self._escape_html(payload.get("sessionId")),
-            "{{ROOT_CAUSE}}": format_solution_text(root_cause),
-            "{{SOLUTION1_INSTRUCTIONS}}": format_solution_text(solution1_text),
-            "{{SOLUTION2_INSTRUCTIONS}}": format_solution_text(solution2_text),
-            "{{SOLUTION3_INSTRUCTIONS}}": format_solution_text(solution3_text),
             "{{CONFIRMED_INSTRUCTIONS}}": format_confirmed_solutions(confirmed_solutions),
         }
 

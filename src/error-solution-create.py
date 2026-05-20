@@ -11,12 +11,14 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Callable, Tuple
 
 import pika
+
 import requests
 from qdrant_client import models
 
 from src.vectordb import QdrantStore
 from src.embeddingmodel import EmbeddingGenerator
 from src.structuraldb import DB
+from src.sendemail import EmailService
 from src.geminicall import GeminiClient
 from src.maskdata import LogSanitizer
 from src.service_alert import ServiceAlertNotifier
@@ -140,6 +142,7 @@ class ServiceContainer:
         self.cb_db = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
         self.cb_llm = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
         self.cb_qdrant = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
+        self.cb_email = CircuitBreaker(fail_threshold=3, reset_timeout_sec=30)
 
         # Service health alert notifier (shared, cooldown-aware)
         self.alert = ServiceAlertNotifier()
@@ -274,6 +277,26 @@ class ServiceContainer:
             raise
 
     @retry(exceptions=(Exception,), max_attempts=3)
+    def send_email(self, template_name: str, payload: Dict[str, Any]) -> bool:
+        """Send notification email with circuit breaker protection."""
+        if self.cb_email.is_open():
+            raise Exception("Email circuit open")
+        try:
+            svc = EmailService(template_name)
+            if template_name == "databasesol-main-ui.html":
+                html = svc.populate_template_db(payload)
+            else:
+                html = svc.populate_template_llm(payload)
+            subject = f"Error Notification: {payload.get('errorType')} in {payload.get('serviceName')}"
+            svc.send_email(html, subject, Config.TO_EMAIL)
+            self.cb_email.record_success()
+            return True
+        except Exception:
+            self.cb_email.record_failure()
+            logger.exception("Send email failed")
+            raise
+
+    @retry(exceptions=(Exception,), max_attempts=3)
     def qdrant_upsert(self, collection: str, vector_id: int, vector, payload: dict):
         if self.cb_qdrant.is_open():
             raise Exception("Qdrant circuit open")
@@ -310,7 +333,7 @@ def store_incoming_payload_and_set_uuid(payload: Dict[str, Any]) -> MessageConte
         # Sanitizer failed to initialize — raise now rather than processing unmasked PII
         raise RuntimeError("LogSanitizer not initialized — cannot process message safely")
     ctx.masked_errordescription = services.sanitizer.sanitize(payload.get('description', ''))
-    logger.debug(f"PII masking applied, desc_len={len(ctx.masked_errordescription)}")
+    logger.info(f"masked data: {ctx.masked_errordescription}")
     ctx.sessionid = str(uuid.uuid4())
     logger.info(f"Processing: app={payload.get('applicationName')} code={payload.get('code')} session={ctx.sessionid}")
     return ctx
@@ -375,6 +398,41 @@ def extract_solutions_from_points(points):
     return final_output.strip()
 
 
+def build_response_from_vector_points(points) -> dict:
+    """
+    Convert Qdrant search result points directly into the same JSON structure
+    as an LLM response: {rootCause, solution1, solution2, solution3}.
+
+    Used when vector DB returns high-confidence matches (score >= 0.85) —
+    skips the LLM call entirely and serves the human-verified solutions directly.
+
+    Each Qdrant point payload contains: {error_code, error_description, solution}.
+    Up to 3 solutions are mapped to solution1, solution2, solution3.
+    Empty strings are used for slots where no matching point exists.
+    """
+    response = {
+        "rootCause": "Retrieved from verified knowledge base (high-confidence vector match)",
+        "solution1": {"instructions": ""},
+        "solution2": {"instructions": ""},
+        "solution3": {"instructions": ""},
+    }
+    for i, point in enumerate(points[:3], start=1):
+        payload = getattr(point, 'payload', {})
+        solution_text = payload.get('solution', '')
+        if solution_text:
+            response[f"solution{i}"] = {"instructions": solution_text}
+    return response
+
+
+def send_formatted_email(email_payload: Dict[str, Any], template_name: str) -> None:
+    """Fire-and-forget email send. Errors are logged but never re-raise to the caller."""
+    try:
+        services.send_email(template_name, email_payload)
+        logger.info("Email notification sent")
+    except Exception:
+        logger.exception("Failed to send notification email — continuing")
+
+
 # main processing flow with guarded calls
 
 def main(ctx: MessageContext):
@@ -403,6 +461,20 @@ def main(ctx: MessageContext):
             llmresponse = json.loads(llm_str) if llm_str else {}
             new_id = db_insert(llmresponse, ctx)
             logger.info(f"Stored verified-solution path result in DB (id={new_id})")
+            '''send_formatted_email({
+                'serviceName': ctx.incoming_payload.get('applicationName'),
+                'environment': Config.ENVIRONMENT,
+                'timestamp': ctx.error_ts_str,
+                'errorType': ctx.incoming_payload.get('code'),
+                'errorMessage': ctx.incoming_payload.get('description'),
+                'errorId': str(new_id),
+                'sessionId': ctx.sessionid,
+                'rootCause': llmresponse.get('rootCause', 'N/A'),
+                'solution1': {'instructions': llmresponse.get('solution1', {}).get('instructions', '')},
+                'solution2': {'instructions': llmresponse.get('solution2', {}).get('instructions', '')},
+                'solution3': {'instructions': llmresponse.get('solution3', {}).get('instructions', '')},
+                'confirmedSolutions': solutions,
+            }, 'databasesol-main-ui.html')'''
             return
         else:
              logger.info("Found record in structural DB but NO verified solution - falling through to Vector DB")
@@ -421,16 +493,20 @@ def main(ctx: MessageContext):
         points = [r for r in result if getattr(r, 'score', 0) >= 0.85]
 
         if len(points) > 0:
-            logger.info(f"Found {len(points)} matching vectors")
-            context_text = extract_solutions_from_points(points)
-            logger.debug(f"Injecting {len(context_text)} chars of vector context into LLM")
-            llmresponse = services.call_llm(
-                ctx.incoming_payload.get('code',''),
-                ctx.masked_errordescription,
-                context=context_text
-            )
-            new_id = db_insert(llmresponse, ctx)
-            logger.info(f"Stored vector-context path result in DB (id={new_id})")
+            logger.info(f"[PATH: VECTOR-DIRECT] Found {len(points)} matching vectors — using directly (no LLM call)")
+            vector_response = build_response_from_vector_points(points)
+            new_id = db_insert(vector_response, ctx)
+            logger.info(f"Stored vector-direct path result in DB (id={new_id})")
+            send_formatted_email({
+                'serviceName': ctx.incoming_payload.get('applicationName'),
+                'environment': Config.ENVIRONMENT,
+                'timestamp': ctx.error_ts_str,
+                'errorType': ctx.incoming_payload.get('code'),
+                'errorMessage': ctx.incoming_payload.get('description'),
+                'errorId': str(new_id),
+                'sessionId': ctx.sessionid,
+                'confirmedSolutions': json.dumps(vector_response),
+            }, 'databasesol-main-ui.html')
             return
 
     except Exception:
@@ -441,6 +517,19 @@ def main(ctx: MessageContext):
     llmresponse = services.call_llm(ctx.incoming_payload.get('code',''), ctx.masked_errordescription)
     new_id = db_insert(llmresponse, ctx)
     logger.info(f"Stored LLM-only path result in DB (id={new_id})")
+    '''send_formatted_email({
+        'serviceName': ctx.incoming_payload.get('applicationName'),
+        'environment': Config.ENVIRONMENT,
+        'timestamp': ctx.error_ts_str,
+        'errorType': ctx.incoming_payload.get('code'),
+        'errorMessage': ctx.incoming_payload.get('description'),
+        'errorId': str(new_id),
+        'sessionId': ctx.sessionid,
+        'rootCause': llmresponse.get('rootCause', 'N/A'),
+        'solution1': {'instructions': llmresponse.get('solution1', {}).get('instructions', '')},
+        'solution2': {'instructions': llmresponse.get('solution2', {}).get('instructions', '')},
+        'solution3': {'instructions': llmresponse.get('solution3', {}).get('instructions', '')},
+    }, 'email-main-ui.html')'''
 
 
 # ---- DLQ helper ----

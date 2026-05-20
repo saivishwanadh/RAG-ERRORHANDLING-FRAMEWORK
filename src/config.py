@@ -18,6 +18,11 @@ class Config:
     # Database
     DB_URL = os.getenv("DB_URL")
     DB_DUPLICATE_WINDOW_MINUTES = int(os.getenv("DB_DUPLICATE_WINDOW_MINUTES", "10"))
+
+    # DB Extractor (db-extract-app.py) — source table polling config
+    SOURCE_DB_TABLE = os.getenv("SOURCE_DB_TABLE", "tibco_error_events")
+    SOURCE_DB_OVERLAP_SECONDS = int(os.getenv("SOURCE_DB_OVERLAP_SECONDS", "120"))
+    SOURCE_DB_POLL_INTERVAL = int(os.getenv("SOURCE_DB_POLL_INTERVAL", "60"))
     
     # RabbitMQ
     RABBIT_URL = os.getenv("RABBIT_URL")
